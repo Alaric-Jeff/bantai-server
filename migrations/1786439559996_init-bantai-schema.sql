@@ -2,6 +2,9 @@
 
 CREATE EXTENSION IF NOT EXISTS postgis;
 
+-- ============================================================
+-- 1. ENUMS
+-- ============================================================
 CREATE TYPE user_role AS ENUM ('driver', 'responder', 'admin', 'super');
 CREATE TYPE cc_type AS ENUM ('barangay', 'police_station', 'mdrrmo');
 CREATE TYPE agency_type AS ENUM ('police', 'barangay_tanod', 'mdrrmo');
@@ -17,27 +20,68 @@ CREATE TYPE police_rank AS ENUM (
     'PMSg', 'PSSg', 'PCpl', 'Pat', 'none'
 );
 CREATE TYPE device_status AS ENUM ('inventory', 'paired', 'reported_lost', 'decommissioned');
+
+-- DEPRECATED & REMOVED: PROPOSE_ALERT_OUTCOME / REVIEW_ALERT_OUTCOME
+-- are gone — the two-stage outcome review workflow (alert_outcome_review)
+-- has been fully removed per team decision. A responder's incident
+-- report disposition now directly and immediately determines
+-- alerts.outcome and closes the incident operationally, with no
+-- separate admin confirmation gate. This is a deliberate simplification
+-- accepted with the trade-off named explicitly: a single responder can
+-- now unilaterally mark an alert as a false alarm. The remaining
+-- REVIEW_INCIDENT_REPORT action covers admin approve/request-revision
+-- on the PAPERWORK only — it no longer touches operational resolution.
 CREATE TYPE audit_action AS ENUM (
     'CREATE_CC', 'CREATE_USER', 'UPDATE_USER', 'CHANGE_ROLE',
-    'REGISTER_DEVICE', 'PAIR_DEVICE', 'UNPAIR_DEVICE',
+    'PAIR_DEVICE', 'UNPAIR_DEVICE',
     'ACKNOWLEDGE_ALERT', 'DISPATCH_RESPONDER', 'RESOLVE_ALERT',
     'AUTH_LOGIN', 'AUTH_LOGOUT', 'AUTH_REVOKE_SESSION',
-    'PROPOSE_ALERT_OUTCOME', 'REVIEW_ALERT_OUTCOME'
+    'SUBMIT_INCIDENT_REPORT', 'REVIEW_INCIDENT_REPORT'
 );
 CREATE TYPE auth_provider_enum AS ENUM ('local', 'google', 'apple');
-CREATE TYPE report_status AS ENUM ('draft', 'submitted', 'under_review', 'approved');
+CREATE TYPE report_status AS ENUM ('draft', 'submitted', 'under_review', 'needs_revision', 'approved');
 CREATE TYPE arrival_confirmation_method AS ENUM ('gps', 'manual');
 CREATE TYPE outcome_enum AS ENUM ('confirmed', 'false_positive', 'unresolved');
-CREATE TYPE outcome_proposal_enum AS ENUM ('confirmed', 'false_positive');
-CREATE TYPE review_status_enum AS ENUM ('pending', 'approved', 'rejected');
 
 CREATE TYPE dispatch_origin_enum AS ENUM ('self_dispatched', 'admin_dispatched');
 CREATE TYPE responder_dispatch_status AS ENUM ('assigned', 'en_route', 'arrived', 'stood_down');
 
-CREATE TYPE peer_response_status AS ENUM ('notified', 'acknowledged', 'verified_true', 'verified_false');
+-- Peers can acknowledge and optionally offer help; they can NEVER
+-- verify or discredit an alert — no verdict values here, ever.
+CREATE TYPE peer_response_status AS ENUM ('notified', 'acknowledged', 'en_route', 'on_scene', 'stood_down');
+
+-- Structured disposition tags for a post-incident report. This is now
+-- THE single source of truth for whether an alert was real —
+-- 'false_alarm' is the only value that flips alerts.outcome to
+-- false_positive; every other value confirms the alert was genuine.
+-- Kept as a proper enum (not free text) specifically because business
+-- logic branches on this value — fragile text-parsing was never a safe
+-- way to drive that decision.
+CREATE TYPE incident_disposition_enum AS ENUM (
+    'treated_on_scene_refused_transport',
+    'scene_secured_by_police',
+    'vehicle_towed_traffic_cleared',
+    'handled_by_barangay',
+    'false_alarm'
+);
+
+-- Responder mobile app inbox.
+CREATE TYPE notification_type_enum AS ENUM (
+    'dispatch_assigned',
+    'report_review_result',
+    'incident_resolved',
+    'shift_ending_soon',
+    'shift_auto_ended'
+);
+
+-- Rendering hint only — lets the UI style a notification correctly
+-- without fragile text-parsing of the title/body.
+CREATE TYPE notification_tone_enum AS ENUM ('success', 'attention', 'info');
 
 
+-- ============================================================
 -- 2. CORE TABLES
+-- ============================================================
 CREATE TABLE IF NOT EXISTS command_center (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(150) NOT NULL UNIQUE,
@@ -68,7 +112,6 @@ CREATE TABLE IF NOT EXISTS user_account (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at TIMESTAMPTZ DEFAULT NULL,
 
-    -- [SENIOR DEV NOTE]: Good constraints here. 
     CONSTRAINT branch_scope_check CHECK (
         (role IN ('admin', 'responder') AND command_center_id IS NOT NULL)
         OR (role IN ('driver', 'super') AND command_center_id IS NULL)
@@ -112,8 +155,6 @@ BEGIN
         SET is_revoked = true
         WHERE user_id = NEW.id AND is_revoked = false;
 
-        -- [SENIOR DEV NOTE]: This will quietly execute and do nothing if the user is a driver/admin.
-        -- That's fine, but just be aware it's an unnecessary table scan for non-responders.
         UPDATE r_profile
         SET availability = 'off_duty'
         WHERE user_id = NEW.id;
@@ -129,7 +170,9 @@ WHEN (NEW.deleted_at IS DISTINCT FROM OLD.deleted_at)
 EXECUTE FUNCTION revoke_sessions_on_soft_delete();
 
 
+-- ============================================================
 -- 3. PROFILE EXTENSIONS
+-- ============================================================
 CREATE TABLE IF NOT EXISTS d_profile (
     user_id UUID PRIMARY KEY REFERENCES user_account(id) ON DELETE CASCADE,
     service_provider service_provider NOT NULL DEFAULT 'independent',
@@ -140,6 +183,9 @@ CREATE TABLE IF NOT EXISTS d_profile (
     date_of_birth DATE,
     emergency_contacts JSONB NOT NULL DEFAULT '[]'::jsonb,
 
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
     CONSTRAINT service_id_requires_provider CHECK (
         (service_provider = 'independent' AND service_id IS NULL)
         OR (service_provider != 'independent' AND service_id IS NOT NULL)
@@ -147,6 +193,11 @@ CREATE TABLE IF NOT EXISTS d_profile (
     CONSTRAINT emergency_contacts_is_array CHECK (jsonb_typeof(emergency_contacts) = 'array'),
     CONSTRAINT emergency_contacts_max_three CHECK (jsonb_array_length(emergency_contacts) <= 3)
 );
+
+CREATE TRIGGER trg_d_profile_updated_at
+BEFORE UPDATE ON d_profile
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
 
 CREATE TABLE IF NOT EXISTS r_profile (
     user_id UUID PRIMARY KEY REFERENCES user_account(id) ON DELETE CASCADE,
@@ -158,6 +209,13 @@ CREATE TABLE IF NOT EXISTS r_profile (
     last_active_at TIMESTAMPTZ DEFAULT now(),
     last_known_location GEOGRAPHY(Point, 4326),
 
+    unit VARCHAR(50),
+    must_change_password BOOLEAN NOT NULL DEFAULT true,
+
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
     CONSTRAINT chck_agency_requirements CHECK (
         (agency = 'police' AND call_sign IS NOT NULL AND rank != 'none') OR
         (agency = 'barangay_tanod') OR
@@ -165,8 +223,15 @@ CREATE TABLE IF NOT EXISTS r_profile (
     )
 );
 
+CREATE TRIGGER trg_r_profile_updated_at
+BEFORE UPDATE ON r_profile
+FOR EACH ROW
+EXECUTE FUNCTION set_updated_at();
 
+
+-- ============================================================
 -- 4. HARDWARE MANAGEMENT
+-- ============================================================
 CREATE TABLE IF NOT EXISTS device (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     hardware_serial VARCHAR(100) NOT NULL UNIQUE,
@@ -188,7 +253,6 @@ CREATE TABLE IF NOT EXISTS device (
 CREATE TABLE IF NOT EXISTS device_pairing_history (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     device_id UUID NOT NULL REFERENCES device(id) ON DELETE CASCADE,
-    -- [SENIOR DEV NOTE]: Good catch keeping ON DELETE RESTRICT here. We need history.
     driver_id UUID NOT NULL REFERENCES user_account(id) ON DELETE RESTRICT,
     paired_by UUID REFERENCES user_account(id) ON DELETE SET NULL,
     paired_at TIMESTAMPTZ NOT NULL,
@@ -201,7 +265,9 @@ CREATE TABLE IF NOT EXISTS device_pairing_history (
 );
 
 
+-- ============================================================
 -- 5. STATEFUL AUTHENTICATION & SESSION MANAGEMENT
+-- ============================================================
 CREATE TABLE IF NOT EXISTS user_session (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES user_account(id) ON DELETE CASCADE,
@@ -217,12 +283,11 @@ CREATE TABLE IF NOT EXISTS user_session (
 );
 
 
+-- ============================================================
 -- 6. INCIDENT & RESPONSE
+-- ============================================================
 CREATE TABLE IF NOT EXISTS alerts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    -- [CRITICAL FIX]: Changed from CASCADE to RESTRICT. 
-    -- You never hard-delete an emergency alert record just because an admin hard-deleted a user. 
-    -- If a user must be deleted, their alerts stay. Soft delete is your safety net anyway.
     driver_id UUID NOT NULL REFERENCES user_account(id) ON DELETE RESTRICT,
     device_id UUID REFERENCES device(id) ON DELETE SET NULL,
     location GEOGRAPHY(Point, 4326) NOT NULL,
@@ -257,7 +322,7 @@ CREATE TABLE IF NOT EXISTS alert_responder_assignment (
     command_center_id UUID NOT NULL,
     responder_id UUID NOT NULL REFERENCES user_account(id) ON DELETE RESTRICT,
     status responder_dispatch_status NOT NULL DEFAULT 'assigned',
-    
+
     dispatch_origin dispatch_origin_enum NOT NULL,
     assigned_by UUID REFERENCES user_account(id) ON DELETE SET NULL,
 
@@ -266,6 +331,8 @@ CREATE TABLE IF NOT EXISTS alert_responder_assignment (
     arrived_at TIMESTAMPTZ,
     arrival_confirmation_method arrival_confirmation_method,
     arrived_confirmed_by UUID REFERENCES user_account(id) ON DELETE SET NULL,
+
+    decline_reason TEXT,
 
     FOREIGN KEY (alert_id, command_center_id)
         REFERENCES alert_branch_response(alert_id, command_center_id)
@@ -278,6 +345,14 @@ CREATE TABLE IF NOT EXISTS alert_responder_assignment (
     CONSTRAINT chck_dispatch_origin_logic CHECK (
         (dispatch_origin = 'self_dispatched' AND assigned_by IS NULL)
         OR (dispatch_origin = 'admin_dispatched' AND assigned_by IS NOT NULL)
+    ),
+    CONSTRAINT chck_decline_reason_required CHECK (
+        NOT (
+            status = 'stood_down'
+            AND dispatch_origin = 'admin_dispatched'
+            AND confirmed_at IS NULL
+            AND decline_reason IS NULL
+        )
     )
 );
 
@@ -285,7 +360,7 @@ CREATE OR REPLACE FUNCTION promote_branch_status_on_dispatch()
 RETURNS TRIGGER AS $$
 BEGIN
     UPDATE alert_branch_response
-    SET status = 'dispatched', 
+    SET status = 'dispatched',
         dispatched_at = COALESCE(dispatched_at, now())
     WHERE alert_id = NEW.alert_id
       AND command_center_id = NEW.command_center_id
@@ -320,66 +395,60 @@ WHEN (NEW.arrived_at IS DISTINCT FROM OLD.arrived_at)
 EXECUTE FUNCTION promote_branch_status_on_first_arrival();
 
 CREATE TABLE IF NOT EXISTS alert_peer_response (
-    id UUID DEFAULT gen_random_uuid(),
-    -- [CRITICAL FIX]: Changed ON DELETE CASCADE to RESTRICT.
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     alert_id UUID NOT NULL REFERENCES alerts(id) ON DELETE RESTRICT,
     peer_driver_id UUID NOT NULL REFERENCES user_account(id) ON DELETE RESTRICT,
     status peer_response_status NOT NULL DEFAULT 'notified',
     notified_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     responded_at TIMESTAMPTZ,
-    
-    PRIMARY KEY (id),
+
     CONSTRAINT uq_alert_peer UNIQUE (alert_id, peer_driver_id)
 );
 
 
--- 7. ALERT OUTCOME REVIEW
-CREATE TABLE IF NOT EXISTS alert_outcome_review (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    -- [CRITICAL FIX]: Changed CASCADE to RESTRICT. 
-    alert_id UUID NOT NULL REFERENCES alerts(id) ON DELETE RESTRICT,
-    proposed_by UUID NOT NULL REFERENCES user_account(id),
-    proposed_outcome outcome_proposal_enum NOT NULL,
-    evidence_urls JSONB NOT NULL DEFAULT '[]'::jsonb,
-    evidence_location GEOGRAPHY(Point, 4326),
-    submitted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    reviewed_by UUID REFERENCES user_account(id),
-    review_status review_status_enum NOT NULL DEFAULT 'pending',
-    review_notes TEXT,
-    reviewed_at TIMESTAMPTZ,
-
-    CONSTRAINT chck_evidence_urls_is_array CHECK (jsonb_typeof(evidence_urls) = 'array'),
-    CONSTRAINT chck_review_consistency CHECK (
-        (review_status = 'pending' AND reviewed_by IS NULL AND reviewed_at IS NULL)
-        OR (review_status != 'pending' AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL)
-    ),
-    CONSTRAINT chck_reviewer_not_proposer CHECK (
-        reviewed_by IS NULL OR reviewed_by != proposed_by
-    )
-);
-
-
--- 8. POST-INCIDENT REPORTING
+-- ============================================================
+-- 7. POST-INCIDENT REPORTING
+-- ============================================================
 CREATE TABLE IF NOT EXISTS incident_report (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    -- [CRITICAL FIX]: Changed CASCADE to RESTRICT. 
     alert_id UUID NOT NULL REFERENCES alerts(id) ON DELETE RESTRICT,
     command_center_id UUID NOT NULL REFERENCES command_center(id) ON DELETE RESTRICT,
 
     assigned_reporter_id UUID REFERENCES user_account(id) ON DELETE SET NULL,
     submitted_by_id UUID REFERENCES user_account(id) ON DELETE SET NULL,
 
+    disposition incident_disposition_enum,
+
     summary TEXT NOT NULL,
     detailed_narrative TEXT,
     evidence_urls JSONB NOT NULL DEFAULT '[]'::jsonb,
     status report_status NOT NULL DEFAULT 'draft',
 
+    reviewed_by UUID REFERENCES user_account(id) ON DELETE SET NULL,
+    reviewer_notes TEXT,
+    reviewed_at TIMESTAMPTZ,
+
     submitted_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    CONSTRAINT chck_evidence_urls_array CHECK (jsonb_typeof(evidence_urls) = 'array')
+    CONSTRAINT chck_evidence_urls_array CHECK (jsonb_typeof(evidence_urls) = 'array'),
+    CONSTRAINT uq_incident_report_per_alert_branch UNIQUE (alert_id, command_center_id),
+    CONSTRAINT chck_disposition_required_past_draft CHECK (
+        status = 'draft' OR disposition IS NOT NULL
+    ),
+    CONSTRAINT chck_report_review_consistency CHECK (
+        (status IN ('draft', 'submitted', 'under_review')
+            AND reviewed_by IS NULL AND reviewed_at IS NULL)
+        OR (status IN ('needs_revision', 'approved')
+            AND reviewed_by IS NOT NULL AND reviewed_at IS NOT NULL)
+    ),
+    CONSTRAINT chck_revision_reason_required CHECK (
+        status != 'needs_revision' OR reviewer_notes IS NOT NULL
+    ),
+    CONSTRAINT chck_report_reviewer_not_submitter CHECK (
+        reviewed_by IS NULL OR reviewed_by != submitted_by_id
+    )
 );
 
 CREATE TRIGGER trg_incident_report_updated_at
@@ -387,8 +456,162 @@ BEFORE UPDATE ON incident_report
 FOR EACH ROW
 EXECUTE FUNCTION set_updated_at();
 
+CREATE OR REPLACE FUNCTION resolve_incident_on_report_submission()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.status = 'submitted' AND (OLD.status IS DISTINCT FROM 'submitted') THEN
+        UPDATE alert_branch_response
+        SET status = 'resolved', resolved_at = now()
+        WHERE alert_id = NEW.alert_id
+          AND command_center_id = NEW.command_center_id
+          AND status != 'resolved';
 
+        UPDATE alerts
+        SET outcome = CASE
+            WHEN NEW.disposition = 'false_alarm' THEN 'false_positive'
+            ELSE 'confirmed'
+        END
+        WHERE id = NEW.alert_id
+          AND outcome = 'unresolved';
+
+        INSERT INTO system_audit_log (actor_id, command_center_id, action, target_entity, target_id, new_payload)
+        VALUES (
+            NEW.submitted_by_id,
+            NEW.command_center_id,
+            'RESOLVE_ALERT',
+            'alerts',
+            NEW.alert_id,
+            jsonb_build_object('disposition', NEW.disposition, 'incident_report_id', NEW.id)
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_resolve_incident_on_report_submission
+AFTER INSERT OR UPDATE ON incident_report
+FOR EACH ROW
+EXECUTE FUNCTION resolve_incident_on_report_submission();
+
+CREATE OR REPLACE FUNCTION notify_and_audit_report_review()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.status IN ('needs_revision', 'approved') AND (OLD.status IS DISTINCT FROM NEW.status) THEN
+        INSERT INTO notification (user_id, type, tone, title, body, related_entity, related_entity_id)
+        VALUES (
+            COALESCE(NEW.submitted_by_id, NEW.assigned_reporter_id),
+            'report_review_result',
+            CASE WHEN NEW.status = 'approved' THEN 'success' ELSE 'attention' END,
+            CASE WHEN NEW.status = 'approved' THEN 'Report approved' ELSE 'Report needs revision' END,
+            COALESCE(
+                NEW.reviewer_notes,
+                CASE WHEN NEW.status = 'approved'
+                    THEN 'Your incident report has been reviewed and approved.'
+                    ELSE 'Your incident report was sent back for revision.'
+                END
+            ),
+            'incident_report',
+            NEW.id
+        );
+
+        INSERT INTO system_audit_log (actor_id, command_center_id, action, target_entity, target_id, old_payload, new_payload)
+        VALUES (
+            NEW.reviewed_by,
+            NEW.command_center_id,
+            'REVIEW_INCIDENT_REPORT',
+            'incident_report',
+            NEW.id,
+            jsonb_build_object('status', OLD.status),
+            jsonb_build_object('status', NEW.status, 'reviewer_notes', NEW.reviewer_notes)
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_notify_and_audit_report_review
+AFTER UPDATE ON incident_report
+FOR EACH ROW
+EXECUTE FUNCTION notify_and_audit_report_review();
+
+
+-- ============================================================
+-- 8. NOTIFICATIONS (responder mobile app inbox)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS notification (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES user_account(id) ON DELETE CASCADE,
+    type notification_type_enum NOT NULL,
+    tone notification_tone_enum NOT NULL DEFAULT 'info',
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+
+    related_entity VARCHAR(50),
+    related_entity_id UUID,
+
+    read_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION notify_on_dispatch_assignment()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_alert_type alert_type;
+BEGIN
+    IF NEW.dispatch_origin = 'admin_dispatched' THEN
+        SELECT alert_type INTO v_alert_type FROM alerts WHERE id = NEW.alert_id;
+
+        INSERT INTO notification (user_id, type, tone, title, body, related_entity, related_entity_id)
+        VALUES (
+            NEW.responder_id,
+            'dispatch_assigned',
+            'attention',
+            'New dispatch assignment',
+            'You have been dispatched to a ' || v_alert_type::text || ' alert.',
+            'alerts',
+            NEW.alert_id
+        );
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_notify_on_dispatch_assignment
+AFTER INSERT ON alert_responder_assignment
+FOR EACH ROW
+EXECUTE FUNCTION notify_on_dispatch_assignment();
+
+CREATE OR REPLACE FUNCTION notify_all_responders_on_resolution()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.status = 'resolved' AND (OLD.status IS DISTINCT FROM 'resolved') THEN
+        INSERT INTO notification (user_id, type, tone, title, body, related_entity, related_entity_id)
+        SELECT
+            ara.responder_id,
+            'incident_resolved',
+            'success',
+            'Incident resolved',
+            'The incident you were dispatched to has been resolved.',
+            'alerts',
+            NEW.alert_id
+        FROM alert_responder_assignment ara
+        WHERE ara.alert_id = NEW.alert_id
+          AND ara.command_center_id = NEW.command_center_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_notify_all_responders_on_resolution
+AFTER UPDATE ON alert_branch_response
+FOR EACH ROW
+WHEN (NEW.status IS DISTINCT FROM OLD.status)
+EXECUTE FUNCTION notify_all_responders_on_resolution();
+
+
+-- ============================================================
 -- 9. SYSTEM AUDIT LOGGING (Partitioned by Range)
+-- ============================================================
 CREATE TABLE IF NOT EXISTS system_audit_log (
     id UUID DEFAULT gen_random_uuid(),
     actor_id UUID REFERENCES user_account(id) ON DELETE SET NULL,
@@ -399,21 +622,23 @@ CREATE TABLE IF NOT EXISTS system_audit_log (
     old_payload JSONB,
     new_payload JSONB,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    
+
     PRIMARY KEY (id, created_at)
 ) PARTITION BY RANGE (created_at);
 
--- [SENIOR DEV NOTE]: The default partition is a catch-all. 
--- If you don't create specific month/year partitions, EVERYTHING goes here, defeating the purpose of partitioning.
--- I've added a partition for this current month (Aug 2026) as an example.
--- You will need a cron job (using NestJS task scheduling) or `pg_partman` to automate future partitions.
-CREATE TABLE system_audit_log_y2026m08 PARTITION OF system_audit_log 
+CREATE TABLE system_audit_log_y2026m08 PARTITION OF system_audit_log
     FOR VALUES FROM ('2026-08-01') TO ('2026-09-01');
+CREATE TABLE system_audit_log_y2026m09 PARTITION OF system_audit_log
+    FOR VALUES FROM ('2026-09-01') TO ('2026-10-01');
+CREATE TABLE system_audit_log_y2026m10 PARTITION OF system_audit_log
+    FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
 
 CREATE TABLE system_audit_log_default PARTITION OF system_audit_log DEFAULT;
 
 
+-- ============================================================
 -- 10. DASHBOARD VIEWS
+-- ============================================================
 CREATE OR REPLACE VIEW branch_incident_logs AS
 SELECT
     a.id AS alert_id,
@@ -422,6 +647,7 @@ SELECT
     a.source AS alert_source,
     a.confidence_level,
     a.outcome,
+    ir.disposition,
     abr.status,
     u.id AS driver_id,
     u.f_name || ' ' || u.l_name AS rider_name,
@@ -436,10 +662,13 @@ SELECT
 FROM alerts a
 JOIN alert_branch_response abr ON a.id = abr.alert_id
 JOIN user_account u ON a.driver_id = u.id
-LEFT JOIN device d ON a.device_id = d.id;
+LEFT JOIN device d ON a.device_id = d.id
+LEFT JOIN incident_report ir ON ir.alert_id = a.id AND ir.command_center_id = abr.command_center_id;
 
 
+-- ============================================================
 -- 11. DIAGNOSTIC VIEWS
+-- ============================================================
 CREATE OR REPLACE VIEW v_index_performance AS
 SELECT
     sui.schemaname,
@@ -474,7 +703,9 @@ SELECT
 FROM pg_stat_user_tables;
 
 
+-- ============================================================
 -- 12. PERFORMANCE INDEXES
+-- ============================================================
 CREATE INDEX idx_command_center_location ON command_center USING GIST (location);
 CREATE INDEX idx_alerts_location ON alerts USING GIST (location);
 
@@ -499,18 +730,21 @@ CREATE INDEX idx_user_session_expires_at ON user_session(expires_at);
 
 CREATE INDEX idx_r_profile_location ON r_profile USING GIST (last_known_location);
 CREATE INDEX idx_r_profile_availability ON r_profile(availability, last_active_at);
+CREATE INDEX idx_r_profile_unit ON r_profile(unit) WHERE unit IS NOT NULL;
 
 CREATE INDEX idx_user_account_deleted_at ON user_account(deleted_at) WHERE deleted_at IS NULL;
 
 CREATE INDEX idx_incident_report_alert ON incident_report(alert_id);
 CREATE INDEX idx_incident_report_cc ON incident_report(command_center_id);
 CREATE INDEX idx_incident_report_assignee ON incident_report(assigned_reporter_id);
+CREATE INDEX idx_incident_report_needs_action ON incident_report(status)
+    WHERE status IN ('draft', 'needs_revision');
 
 CREATE INDEX idx_device_pairing_history_device ON device_pairing_history(device_id);
 CREATE INDEX idx_device_pairing_history_driver ON device_pairing_history(driver_id);
 
-CREATE INDEX idx_alert_outcome_review_alert ON alert_outcome_review(alert_id);
-CREATE INDEX idx_alert_outcome_review_pending ON alert_outcome_review(review_status) WHERE review_status = 'pending';
+CREATE INDEX idx_notification_user_recent ON notification(user_id, created_at DESC);
+CREATE INDEX idx_notification_unread ON notification(user_id) WHERE read_at IS NULL;
 
 
 -- Down Migration
@@ -519,10 +753,9 @@ DROP VIEW IF EXISTS v_table_index_usage;
 DROP VIEW IF EXISTS v_index_performance;
 DROP VIEW IF EXISTS branch_incident_logs;
 
--- [SENIOR DEV NOTE]: Ensure partitions are dropped by cascading the parent.
 DROP TABLE IF EXISTS system_audit_log CASCADE;
+DROP TABLE IF EXISTS notification CASCADE;
 DROP TABLE IF EXISTS incident_report CASCADE;
-DROP TABLE IF EXISTS alert_outcome_review CASCADE;
 DROP TABLE IF EXISTS alert_responder_assignment CASCADE;
 DROP TABLE IF EXISTS alert_branch_response CASCADE;
 DROP TABLE IF EXISTS alert_peer_response CASCADE;
@@ -535,16 +768,21 @@ DROP TABLE IF EXISTS d_profile CASCADE;
 DROP TABLE IF EXISTS user_account CASCADE;
 DROP TABLE IF EXISTS command_center CASCADE;
 
+DROP FUNCTION IF EXISTS notify_all_responders_on_resolution();
+DROP FUNCTION IF EXISTS notify_on_dispatch_assignment();
+DROP FUNCTION IF EXISTS notify_and_audit_report_review();
+DROP FUNCTION IF EXISTS resolve_incident_on_report_submission();
 DROP FUNCTION IF EXISTS promote_branch_status_on_dispatch();
 DROP FUNCTION IF EXISTS promote_branch_status_on_first_arrival();
 DROP FUNCTION IF EXISTS revoke_sessions_on_soft_delete();
 DROP FUNCTION IF EXISTS set_updated_at();
 
+DROP TYPE IF EXISTS notification_tone_enum;
+DROP TYPE IF EXISTS notification_type_enum;
+DROP TYPE IF EXISTS incident_disposition_enum;
 DROP TYPE IF EXISTS peer_response_status;
 DROP TYPE IF EXISTS dispatch_origin_enum;
 DROP TYPE IF EXISTS responder_dispatch_status;
-DROP TYPE IF EXISTS review_status_enum;
-DROP TYPE IF EXISTS outcome_proposal_enum;
 DROP TYPE IF EXISTS outcome_enum;
 DROP TYPE IF EXISTS arrival_confirmation_method;
 DROP TYPE IF EXISTS report_status;

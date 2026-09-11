@@ -1,7 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService } from '../../database/database.service';
 import { UserAuthRow } from './interfaces/user-auth-row.interface';
-import { Role } from './enums/role.enum';
+import {
+  PasswordRequirementState,
+  ChangedPassRow,
+} from './interfaces/user-pass-change-requirement.interface';
+import { Role } from '../../common/enums/role-enum';
 
 @Injectable()
 export class AuthRepository {
@@ -9,7 +13,7 @@ export class AuthRepository {
 
   async findUserByEmail(email: string): Promise<UserAuthRow | null> {
     const sql = `
-      SELECT id, password_hash, role, deleted_at, command_center_id 
+      SELECT id, password_hash, role, deleted_at, command_center_id
       FROM user_account 
       WHERE email = $1
       LIMIT 1;
@@ -58,6 +62,31 @@ export class AuthRepository {
 
     await this.db.query(sql, [hash]);
     return;
+  }
+
+  async findPasswordChangeRequirement(
+    id: string,
+  ): Promise<PasswordRequirementState | null> {
+    const sql = 'SELECT must_change_password FROM r_profile WHERE user_id = $1';
+    const { rows } = await this.db.query<PasswordRequirementState>(sql, [id]);
+
+    return rows[0] || null;
+  }
+
+  async updateTempPassword(
+    id: string,
+    newPassword: string,
+  ): Promise<ChangedPassRow> {
+    const sql =
+      'UPDATE user_accounts SET password = $1, must_change_password = $2 WHERE user_id = $3 RETURNING password, must_change_password';
+
+    const { rows } = await this.db.query<ChangedPassRow>(sql, [
+      newPassword,
+      false,
+      id,
+    ]);
+
+    return rows[0];
   }
 
   /**

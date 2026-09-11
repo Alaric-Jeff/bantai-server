@@ -4,10 +4,7 @@ import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtPayload } from '../interfaces/jwt-payload.interface';
 import { FastifyRequest } from 'fastify';
-
-interface RequestWithCookies extends FastifyRequest {
-  cookies: Partial<Record<string, string>>;
-}
+import { RequestWithCookies } from '../interfaces/request-w-cookie.interface';
 
 function extractRefreshToken(request: FastifyRequest): string | null {
   const { cookies } = request as RequestWithCookies;
@@ -46,7 +43,8 @@ export class JwtRefreshStrategy extends PassportStrategy(
     this.logger.debug(`Refresh Token validated for user ID: ${payload.sub}`);
 
     return {
-      ...payload,
+      sub: payload.sub,
+      role: payload.role,
       refreshToken,
     };
   }

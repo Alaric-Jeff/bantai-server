@@ -7,6 +7,7 @@ import {
   Req,
   Res,
   UnauthorizedException,
+  UseGuards,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { FastifyReply, FastifyRequest } from 'fastify';
@@ -15,6 +16,12 @@ import { AuthService } from './auth.service';
 import { EmailPasswordDto } from './dto/email-password.dto';
 import { ReplyWithCookie } from './interfaces/reply-w-cookie.interface';
 import { AuthTokens } from './interfaces/auth-token.interface';
+import { AuthenticatedUser } from '../../common/interfaces/authenticated-user.interface';
+import { ChangedPassDTO } from './dto/change-temp-password.dto';
+import { JwtGuard } from '../../common/guards/jwt.guard';
+import { RolesGuard } from '../../common/guards/roles.guard';
+import { Roles } from '../../common/decorators/role.decorator';
+import { Role } from '../../common/enums/role-enum';
 
 // Fastify's request type doesn't know about @fastify/cookie's `cookies`
 // property unless the plugin's type augmentation is registered globally.
@@ -58,6 +65,18 @@ export class AuthController {
     this.setRefreshTokenCookie(response, tokens.refreshToken);
 
     return tokens;
+  }
+
+  @HttpCode(HttpStatus.OK)
+  @Post('forced_password_reset')
+  @UseGuards(JwtGuard, RolesGuard)
+  @Roles(Role.ADMIN, Role.SUPER, Role.RESPONDER)
+  async forcedPasswordReset(
+    @Req() req: FastifyRequest & { user: AuthenticatedUser },
+    @Body() dto: ChangedPassDTO,
+  ) {
+    const id: string = req.user.sub;
+    return await this.authService.changeTempPassword(id, dto);
   }
 
   @HttpCode(HttpStatus.OK)

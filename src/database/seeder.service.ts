@@ -2,7 +2,7 @@ import { Injectable, OnApplicationBootstrap, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import { DatabaseService } from './database.service';
-import { Role } from '../modules/auth/enums/role.enum';
+import { Role } from '../common/enums/role-enum';
 
 @Injectable()
 export class SeederService implements OnApplicationBootstrap {

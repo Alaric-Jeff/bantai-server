@@ -1,9 +1,6 @@
-import { IsEmail, IsString, Length, Matches } from 'class-validator';
+import { IsString, Length, Matches } from 'class-validator';
 
-export class ManualSignupDto {
-  @IsEmail()
-  email!: string;
-
+export class ChangedPassDTO {
   @IsString()
   @Length(10, 128, {
     message: 'Password must be between 10 and 128 characters.',
@@ -12,5 +9,5 @@ export class ManualSignupDto {
     message:
       'Password must contain at least 1 uppercase letter, 1 number, and 1 special character.',
   })
-  password!: string;
+  newPassword!: string;
 }

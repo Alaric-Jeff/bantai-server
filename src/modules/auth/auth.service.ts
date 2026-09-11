@@ -3,8 +3,9 @@ import {
   UnauthorizedException,
   Logger,
   InternalServerErrorException,
+  BadRequestException,
 } from '@nestjs/common';
-import { JwtService, JwtSignOptions } from '@nestjs/jwt';
+import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import * as crypto from 'crypto';
@@ -13,8 +14,9 @@ import ms from 'ms';
 import { AuthRepository } from './auth.repository';
 import { EmailPasswordDto } from './dto/email-password.dto';
 import { JwtPayload } from './interfaces/jwt-payload.interface';
-import { Role } from './enums/role.enum';
+import { Role } from '../../common/enums/role-enum';
 import { AuthTokens } from './interfaces/auth-token.interface';
+import { ChangedPassDTO } from './dto/change-temp-password.dto';
 
 interface SignedTokens extends AuthTokens {
   refreshTokenHash: string;
@@ -72,28 +74,33 @@ export class AuthService {
   ): Promise<SignedTokens> {
     const payload = this.createPayload(userId, role, commandCenterId);
 
+    const accessTtl = this.configService.getOrThrow<string>('JWT_EXPIRATION');
+    const refreshTtl = this.configService.getOrThrow<string>(
+      'JWT_REFRESH_EXPIRATION',
+    );
+
+    const accessExpiresInSec = Math.floor(
+      ms(accessTtl as ms.StringValue) / 1000,
+    );
+    const refreshExpiresInSec = Math.floor(
+      ms(refreshTtl as ms.StringValue) / 1000,
+    );
+
     const [accessToken, refreshToken] = await Promise.all([
       this.jwtService.signAsync(payload, {
         secret: this.configService.getOrThrow<string>('JWT_SECRET'),
-        expiresIn: this.configService.getOrThrow<string>(
-          'JWT_EXPIRATION',
-        ) as JwtSignOptions['expiresIn'],
+        expiresIn: accessExpiresInSec,
       }),
       this.jwtService.signAsync(
         { sub: userId, jti: randomUUID() },
         {
           secret: this.configService.getOrThrow<string>('JWT_REFRESH_SECRET'),
-          expiresIn: this.configService.getOrThrow<string>(
-            'JWT_REFRESH_EXPIRATION',
-          ) as JwtSignOptions['expiresIn'],
+          expiresIn: refreshExpiresInSec,
         },
       ),
     ]);
 
     const refreshTokenHash = this.hashToken(refreshToken);
-    const refreshTtl = this.configService.getOrThrow<string>(
-      'JWT_REFRESH_EXPIRATION',
-    );
     const refreshExpiresAt = new Date(
       Date.now() + ms(refreshTtl as ms.StringValue),
     );
@@ -162,6 +169,30 @@ export class AuthService {
       }
       this.logger.error(`Error during local login for email ${email}`, err);
       throw new InternalServerErrorException('Authentication failed.');
+    }
+  }
+
+  async changeTempPassword(id: string, dto: ChangedPassDTO) {
+    const { newPassword } = dto;
+
+    const isForcedToChangePass =
+      await this.authRepository.findPasswordChangeRequirement(id);
+
+    if (!isForcedToChangePass) {
+      this.logger.warn(
+        `User ${id} attempted password reset without 'must_change_password' flag`,
+      );
+      throw new BadRequestException('User is not required to change password');
+    }
+    try {
+      const hashedPassword = await bcrypt.hash(newPassword, 12);
+      await this.authRepository.updateTempPassword(hashedPassword, id);
+    } catch (err: unknown) {
+      this.logger.error(
+        `Failed to hash/update password for user ${id}`,
+        err instanceof Error ? err.stack : err,
+      );
+      throw new InternalServerErrorException('Failed to update password');
     }
   }
 

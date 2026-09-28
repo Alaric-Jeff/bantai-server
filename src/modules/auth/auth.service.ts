@@ -16,12 +16,26 @@ import { EmailPasswordDto } from './dto/email-password.dto';
 import { JwtPayload } from './interfaces/jwt-payload.interface';
 import { Role } from '../../common/enums/role-enum';
 import { AuthTokens } from './interfaces/auth-token.interface';
-import { ChangedPassDTO } from './dto/change-temp-password.dto';
+import { EmailService } from '../email/email.service';
+import { CreateActivationTokenData } from './types/create-activation-token.types';
+import { AccountTokenPurposeEnum } from './enums/account-token-purpose.enum';
+import { AccountStatusEnum } from './enums/account-status.enum';
 
 interface SignedTokens extends AuthTokens {
   refreshTokenHash: string;
   refreshExpiresAt: Date;
 }
+
+/**
+ * Maps each account-action token purpose to the config key holding
+ * its TTL. Keeping this as a lookup (rather than branching in code)
+ * means adding a new purpose later is a one-line addition here plus
+ * a new .env key — no new if/switch needed.
+ */
+const TOKEN_TTL_CONFIG_KEY: Record<AccountTokenPurposeEnum, string> = {
+  [AccountTokenPurposeEnum.ACTIVATION]: 'ACTIVATION_TOKEN_EXPIRATION',
+  [AccountTokenPurposeEnum.PASSWORD_RESET]: 'PASSWORD_RESET_TOKEN_EXPIRATION',
+};
 
 @Injectable()
 export class AuthService {
@@ -31,6 +45,7 @@ export class AuthService {
     private readonly authRepository: AuthRepository,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly emailService: EmailService,
   ) {}
 
   private createPayload(
@@ -45,6 +60,14 @@ export class AuthService {
     };
   }
 
+  /**
+   * Fast, deterministic hash used for both refresh tokens and account
+   * action tokens. SHA-256 (not bcrypt/argon2) is correct here because
+   * the input is a high-entropy random secret, not a low-entropy
+   * user-chosen password — there's nothing to slow down an attacker
+   * guessing, so a fast hash keeps lookups cheap without any security
+   * trade-off.
+   */
   private hashToken(token: string): string {
     return crypto.createHash('sha256').update(token).digest('hex');
   }
@@ -172,27 +195,98 @@ export class AuthService {
     }
   }
 
-  async changeTempPassword(id: string, dto: ChangedPassDTO) {
-    const { newPassword } = dto;
+  /**
+   * Core token-issuing routine shared by both activation and
+   * password-reset flows. Generates a random raw secret, hashes it for
+   * storage, computes expiry from the purpose's configured TTL,
+   * invalidates any previously-live token for the same user+purpose
+   * (per the migration's app-layer requirement — the DB's unique index
+   * only allows one live token per user per purpose), and persists the
+   * new row.
+   *
+   * @param userId Account the token is being issued for.
+   * @param purpose Which flow this token authorizes — `activation` or
+   *   `password_reset`. Determines both the TTL config key used here
+   *   and, at redemption time, which state transition is valid.
+   * @returns The RAW (unhashed) token. This is the only value that
+   *   should ever be emailed to the user — it is never persisted
+   *   anywhere itself, only its SHA-256 hash is.
+   */
+  private async generateActionToken(
+    userId: string,
+    purpose: AccountTokenPurposeEnum,
+  ): Promise<string> {
+    // Invalidate any existing unused token for this user+purpose first,
+    // so the insert below never collides with
+    // uq_account_action_token_live_per_purpose.
+    await this.authRepository.invalidateLiveToken(userId, purpose);
 
-    const isForcedToChangePass =
-      await this.authRepository.findPasswordChangeRequirement(id);
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = this.hashToken(rawToken);
 
-    if (!isForcedToChangePass) {
+    const ttlConfigKey = TOKEN_TTL_CONFIG_KEY[purpose];
+    const ttl = this.configService.getOrThrow<string>(ttlConfigKey);
+    const expiresAt = new Date(Date.now() + ms(ttl as ms.StringValue));
+
+    const data: CreateActivationTokenData = {
+      user_id: userId,
+      purpose,
+      token_hash: tokenHash,
+      expires_at: expiresAt,
+    };
+
+    await this.authRepository.createAccountActionToken(data);
+
+    return rawToken;
+  }
+
+  /**
+   * Issues an activation token for a `pending_activation` account and
+   * emails the activation link to the account holder. This is the
+   * only way a provisioned admin/responder/super account can ever
+   * receive a password — there is no temporary password generated
+   * anywhere in this flow.
+   *
+   * Called immediately after account provisioning (e.g. an admin
+   * creating a responder via user_account + r_profile), which is why
+   * this takes `email` directly rather than looking it up — the
+   * caller already has it from the `INSERT ... RETURNING id` +
+   * creation DTO, so no extra DB round-trip is needed here.
+   *
+   * @param userId The freshly-provisioned account's id. Must
+   *   currently be in `pending_activation` status.
+   * @param email Address to send the activation link to.
+   * @throws {BadRequestException} If the account doesn't exist or is
+   *   not in `pending_activation` status.
+   */
+  async createActivationToken(userId: string, email: string): Promise<void> {
+    const state = await this.authRepository.checkUserActivationState(userId);
+
+    if (
+      !state ||
+      state.account_status !== AccountStatusEnum.PENDING_ACTIVATION
+    ) {
       this.logger.warn(
-        `User ${id} attempted password reset without 'must_change_password' flag`,
+        `Activation token requested for non-pending account: ${userId}`,
       );
-      throw new BadRequestException('User is not required to change password');
+      throw new BadRequestException('Account is not pending activation.');
     }
+
     try {
-      const hashedPassword = await bcrypt.hash(newPassword, 12);
-      await this.authRepository.updateTempPassword(hashedPassword, id);
+      const rawToken = await this.generateActionToken(
+        userId,
+        AccountTokenPurposeEnum.ACTIVATION,
+      );
+
+      await this.emailService.sendActivationEmail(email, rawToken);
     } catch (err: unknown) {
       this.logger.error(
-        `Failed to hash/update password for user ${id}`,
+        `Failed to create/send activation token for user ${userId}`,
         err instanceof Error ? err.stack : err,
       );
-      throw new InternalServerErrorException('Failed to update password');
+      throw new InternalServerErrorException(
+        'Failed to send activation email.',
+      );
     }
   }
 

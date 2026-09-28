@@ -7,6 +7,7 @@ import { AuthService } from './auth.service';
 import { AuthRepository } from './auth.repository';
 import { JwtStrategy } from './strategies/jwt.strategy';
 import { DatabaseModule } from '../../database/database.module';
+import { EmailModule } from '../email/email.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { DatabaseModule } from '../../database/database.module';
     JwtModule.register({}),
     ConfigModule,
     DatabaseModule,
+    EmailModule,
   ],
   controllers: [AuthController],
   providers: [AuthService, AuthRepository, JwtStrategy],

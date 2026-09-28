@@ -1,11 +1,10 @@
 import { Injectable } from '@nestjs/common';
 import { DatabaseService } from '../../database/database.service';
 import { UserAuthRow } from './interfaces/user-auth-row.interface';
-import {
-  PasswordRequirementState,
-  ChangedPassRow,
-} from './interfaces/user-pass-change-requirement.interface';
 import { Role } from '../../common/enums/role-enum';
+import { ActivationStateRow } from './interfaces/activation-state-row.interface';
+import { CreateActivationTokenData } from './types/create-activation-token.types';
+import { AccountTokenPurposeEnum } from './enums/account-token-purpose.enum';
 
 @Injectable()
 export class AuthRepository {
@@ -20,6 +19,17 @@ export class AuthRepository {
     `;
 
     const { rows } = await this.db.query<UserAuthRow>(sql, [email]);
+    return rows[0] || null;
+  }
+
+  async findUserById(id: string): Promise<UserAuthRow | null> {
+    const sql = `
+    SELECT id, email, password_hash, role, account_status, deleted_at, command_center_id
+    FROM user_account
+    WHERE id = $1
+    LIMIT 1;
+  `;
+    const { rows } = await this.db.query<UserAuthRow>(sql, [id]);
     return rows[0] || null;
   }
 
@@ -64,29 +74,56 @@ export class AuthRepository {
     return;
   }
 
-  async findPasswordChangeRequirement(
-    id: string,
-  ): Promise<PasswordRequirementState | null> {
-    const sql = 'SELECT must_change_password FROM r_profile WHERE user_id = $1';
-    const { rows } = await this.db.query<PasswordRequirementState>(sql, [id]);
-
-    return rows[0] || null;
+  async checkUserActivationState(id: string): Promise<ActivationStateRow> {
+    const sql = 'SELECT account_status FROM user_account WHERE id = $1';
+    const { rows } = await this.db.query<ActivationStateRow>(sql, [id]);
+    return rows[0];
   }
 
-  async updateTempPassword(
-    id: string,
-    newPassword: string,
-  ): Promise<ChangedPassRow> {
+  async createAccountActionToken(data: CreateActivationTokenData) {
+    const { user_id, purpose, token_hash, expires_at } = data;
     const sql =
-      'UPDATE user_accounts SET password = $1, must_change_password = $2 WHERE user_id = $3 RETURNING password, must_change_password';
+      'INSERT INTO account_action_token(user_id, purpose, token_hash, expires_at) VALUES($1, $2, $3, $4)';
+    await this.db.query(sql, [user_id, purpose, token_hash, expires_at]);
+  }
 
-    const { rows } = await this.db.query<ChangedPassRow>(sql, [
-      newPassword,
-      false,
-      id,
-    ]);
+  async updateAccountStatusAndSetPassword(id: string, password_hash: string) {
+    await this.db.withTransaction(async (client) => {
+      const sql =
+        'UPDATE user_account SET account_status = $1, password_hash = $2 WHERE id = $3';
+      await client.query(sql, ['active', password_hash, id]);
+    });
+  }
 
-    return rows[0];
+  /**
+   * Marks any existing unused token for this user+purpose as used,
+   * freeing up the `uq_account_action_token_live_per_purpose` slot so a
+   * new token can be issued for the same user and purpose. Also has the
+   * side effect of killing the previous link — once a new activation or
+   * reset token is issued, the old one should stop working rather than
+   * staying valid in parallel (e.g. after a "resend email" request).
+   *
+   * No-op if no live (unused) token currently exists for this
+   * user+purpose — safe to call unconditionally before every token
+   * creation, per the migration's app-layer requirement that issuing a
+   * second token should invalidate the first rather than leaving two
+   * valid tokens outstanding.
+   *
+   * @param userId Account whose live token (if any) should be invalidated.
+   * @param purpose Which token purpose to target — invalidating an
+   *   `activation` token never touches a `password_reset` token for the
+   *   same user, and vice versa.
+   */
+  async invalidateLiveToken(
+    userId: string,
+    purpose: AccountTokenPurposeEnum,
+  ): Promise<void> {
+    const sql = `
+    UPDATE account_action_token
+    SET used_at = now()
+    WHERE user_id = $1 AND purpose = $2 AND used_at IS NULL
+  `;
+    await this.db.query(sql, [userId, purpose]);
   }
 
   /**

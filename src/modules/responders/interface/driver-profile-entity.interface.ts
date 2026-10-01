@@ -1,5 +1,5 @@
 import { BloodTypeEnum } from '../enums/blood-type.enum';
-import { ServiceProvider } from '../enums/service-provider.enum';
+import { ServiceProviderEnum } from '../enums/service-provider.enum';
 
 export type EmergencyContact = {
   name: string;
@@ -9,7 +9,7 @@ export type EmergencyContact = {
 
 export interface DriverProfileEntity {
   user_id: string;
-  service_provider: ServiceProvider;
+  service_provider: ServiceProviderEnum;
   service_id: string | null;
 
   plate_number: string | null;

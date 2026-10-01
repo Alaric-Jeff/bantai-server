@@ -5,14 +5,17 @@ import { Role } from '../../common/enums/role-enum';
 import { ActivationStateRow } from './interfaces/activation-state-row.interface';
 import { CreateActivationTokenData } from './types/create-activation-token.types';
 import { AccountTokenPurposeEnum } from './enums/account-token-purpose.enum';
+import { AuthProviderEnum } from '../responders/enums/auth-provider.enum';
 
 @Injectable()
 export class AuthRepository {
   constructor(private readonly db: DatabaseService) {}
 
   async findUserByEmail(email: string): Promise<UserAuthRow | null> {
+    // account_status is selected so login can reject pending_activation
+    // accounts (which have a NULL password_hash) before comparing.
     const sql = `
-      SELECT id, password_hash, role, deleted_at, command_center_id
+      SELECT id, password_hash, role, account_status, deleted_at, command_center_id
       FROM user_account 
       WHERE email = $1
       LIMIT 1;
@@ -80,50 +83,158 @@ export class AuthRepository {
     return rows[0];
   }
 
-  async createAccountActionToken(data: CreateActivationTokenData) {
-    const { user_id, purpose, token_hash, expires_at } = data;
-    const sql =
-      'INSERT INTO account_action_token(user_id, purpose, token_hash, expires_at) VALUES($1, $2, $3, $4)';
-    await this.db.query(sql, [user_id, purpose, token_hash, expires_at]);
+  /**
+   * For the two GET verify endpoints. Returns the token's owner only if
+   * the token is live AND the account is in the state that purpose
+   * requires (activation -> pending_activation, reset -> active), so a
+   * token can't be used against the wrong kind of account.
+   *
+   * @param tokenHash SHA-256 hash of the raw token from the link.
+   * @param purpose Which flow is asking; a token minted for the other
+   *   purpose will not match.
+   */
+  async findLiveTokenWithUser(
+    tokenHash: string,
+    purpose: AccountTokenPurposeEnum,
+  ): Promise<{ user_id: string; email: string } | null> {
+    const sql = `
+      SELECT t.user_id, u.email
+      FROM account_action_token t
+      JOIN user_account u ON u.id = t.user_id
+      WHERE t.token_hash = $1
+        AND t.purpose = $2
+        AND t.used_at IS NULL
+        AND t.expires_at > now()
+        AND u.deleted_at IS NULL
+        AND (
+          (t.purpose = 'activation'     AND u.account_status = 'pending_activation')
+          OR (t.purpose = 'password_reset' AND u.account_status = 'active')
+        )
+      LIMIT 1;
+    `;
+    const { rows } = await this.db.query<{ user_id: string; email: string }>(
+      sql,
+      [tokenHash, purpose],
+    );
+    return rows[0] || null;
   }
 
-  async updateAccountStatusAndSetPassword(id: string, password_hash: string) {
+  async findUserBySocialIdentity(
+    providerId: string,
+    authProvider: AuthProviderEnum,
+  ): Promise<UserAuthRow | null> {
+    const sql = `
+      SELECT id, password_hash, role, account_status, deleted_at, command_center_id
+      FROM user_account 
+      WHERE provider_id = $1 AND auth_provider = $2
+      LIMIT 1;
+    `;
+
+    const { rows } = await this.db.query<UserAuthRow>(sql, [
+      providerId,
+      authProvider,
+    ]);
+    return rows[0] || null;
+  }
+
+  /**
+   * Issues a new activation / reset token, replacing any live one for
+   * the same user and purpose, in ONE transaction.
+   *
+   * - Locking the user row first serializes concurrent "resend" requests
+   *   so they can't race into `uq_account_action_token_live_per_purpose`.
+   * - Superseded tokens are deleted rather than stamped `used_at`, so
+   *   `used_at` only ever means "consumed by the holder".
+   * - Issuing a new token kills the previous link (e.g. after a "resend
+   *   email" request) instead of leaving two valid tokens outstanding,
+   *   per the migration's app-layer requirement.
+   * - Purposes are independent: replacing an `activation` token never
+   *   touches a `password_reset` token for the same user, and vice versa.
+   */
+  async replaceAccountActionToken(
+    data: CreateActivationTokenData,
+  ): Promise<void> {
+    const { user_id, purpose, token_hash, expires_at } = data;
     await this.db.withTransaction(async (client) => {
-      const sql =
-        'UPDATE user_account SET account_status = $1, password_hash = $2 WHERE id = $3';
-      await client.query(sql, ['active', password_hash, id]);
+      await client.query(
+        `SELECT id FROM user_account WHERE id = $1 FOR UPDATE`,
+        [user_id],
+      );
+      await client.query(
+        `DELETE FROM account_action_token
+         WHERE user_id = $1 AND purpose = $2 AND used_at IS NULL`,
+        [user_id, purpose],
+      );
+      await client.query(
+        `INSERT INTO account_action_token(user_id, purpose, token_hash, expires_at)
+         VALUES($1, $2, $3, $4)`,
+        [user_id, purpose, token_hash, expires_at],
+      );
     });
   }
 
   /**
-   * Marks any existing unused token for this user+purpose as used,
-   * freeing up the `uq_account_action_token_live_per_purpose` slot so a
-   * new token can be issued for the same user and purpose. Also has the
-   * side effect of killing the previous link — once a new activation or
-   * reset token is issued, the old one should stop working rather than
-   * staying valid in parallel (e.g. after a "resend email" request).
+   * For the two POST submit endpoints. Everything that must be true
+   * together happens in one transaction: the token is locked and
+   * re-validated (so a double-click or replay can't use it twice),
+   * marked used, the password is set, the account is active, and all
+   * existing sessions are dropped (matters for compromise-response
+   * resets). Returns null if the token is no longer valid.
    *
-   * No-op if no live (unused) token currently exists for this
-   * user+purpose — safe to call unconditionally before every token
-   * creation, per the migration's app-layer requirement that issuing a
-   * second token should invalidate the first rather than leaving two
-   * valid tokens outstanding.
-   *
-   * @param userId Account whose live token (if any) should be invalidated.
-   * @param purpose Which token purpose to target — invalidating an
-   *   `activation` token never touches a `password_reset` token for the
-   *   same user, and vice versa.
+   * password_hash and account_status must change together
+   * (chck_auth_requirements); setting 'active' is harmless for resets
+   * since those accounts are already active.
    */
-  async invalidateLiveToken(
-    userId: string,
+  async consumeTokenAndSetPassword(
+    tokenHash: string,
     purpose: AccountTokenPurposeEnum,
-  ): Promise<void> {
-    const sql = `
-    UPDATE account_action_token
-    SET used_at = now()
-    WHERE user_id = $1 AND purpose = $2 AND used_at IS NULL
-  `;
-    await this.db.query(sql, [userId, purpose]);
+    passwordHash: string,
+  ): Promise<{ user_id: string } | null> {
+    return this.db.withTransaction(async (client) => {
+      const { rows } = await client.query<{ id: string; user_id: string }>(
+        `SELECT t.id, t.user_id
+         FROM account_action_token t
+         JOIN user_account u ON u.id = t.user_id
+         WHERE t.token_hash = $1
+           AND t.purpose = $2
+           AND t.used_at IS NULL
+           AND t.expires_at > now()
+           AND u.deleted_at IS NULL
+           AND (
+             (t.purpose = 'activation'     AND u.account_status = 'pending_activation')
+             OR (t.purpose = 'password_reset' AND u.account_status = 'active')
+           )
+         FOR UPDATE OF t`,
+        [tokenHash, purpose],
+      );
+      if (!rows[0]) return null;
+
+      const { id: tokenId, user_id } = rows[0];
+
+      await client.query(
+        `UPDATE account_action_token SET used_at = now() WHERE id = $1`,
+        [tokenId],
+      );
+      await client.query(
+        `UPDATE user_account
+         SET password_hash = $1, account_status = 'active'
+         WHERE id = $2`,
+        [passwordHash, user_id],
+      );
+      await client.query(`DELETE FROM user_session WHERE user_id = $1`, [
+        user_id,
+      ]);
+
+      if (purpose === AccountTokenPurposeEnum.ACTIVATION) {
+        await client.query(
+          `INSERT INTO system_audit_log(actor_id, action, target_entity, target_id)
+           VALUES ($1, 'ACTIVATE_ACCOUNT', 'user_account', $1)`,
+          [user_id],
+        );
+      }
+
+      return { user_id };
+    });
   }
 
   /**

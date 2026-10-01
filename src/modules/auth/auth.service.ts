@@ -4,6 +4,7 @@ import {
   Logger,
   InternalServerErrorException,
   BadRequestException,
+  NotFoundException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -20,6 +21,8 @@ import { EmailService } from '../email/email.service';
 import { CreateActivationTokenData } from './types/create-activation-token.types';
 import { AccountTokenPurposeEnum } from './enums/account-token-purpose.enum';
 import { AccountStatusEnum } from './enums/account-status.enum';
+import { GoogleService } from './providers/google.service';
+import { AuthProviderEnum } from '../responders/enums/auth-provider.enum';
 
 interface SignedTokens extends AuthTokens {
   refreshTokenHash: string;
@@ -37,6 +40,18 @@ const TOKEN_TTL_CONFIG_KEY: Record<AccountTokenPurposeEnum, string> = {
   [AccountTokenPurposeEnum.PASSWORD_RESET]: 'PASSWORD_RESET_TOKEN_EXPIRATION',
 };
 
+/**
+ * One generic message for every way a link can be unusable (unknown,
+ * expired, already used, wrong purpose, wrong account state). The SPA
+ * shows this text as-is, and being vague means the endpoint can't be
+ * used to probe which tokens or accounts exist.
+ */
+export const INVALID_LINK_MESSAGE =
+  'This link has expired or has already been used.';
+
+// Match whatever cost factor the rest of the app uses for bcrypt.
+const BCRYPT_SALT_ROUNDS = 12;
+
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
@@ -46,6 +61,7 @@ export class AuthService {
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
     private readonly emailService: EmailService,
+    private readonly googleService: GoogleService,
   ) {}
 
   private createPayload(
@@ -198,11 +214,11 @@ export class AuthService {
   /**
    * Core token-issuing routine shared by both activation and
    * password-reset flows. Generates a random raw secret, hashes it for
-   * storage, computes expiry from the purpose's configured TTL,
-   * invalidates any previously-live token for the same user+purpose
-   * (per the migration's app-layer requirement — the DB's unique index
-   * only allows one live token per user per purpose), and persists the
-   * new row.
+   * storage, computes expiry from the purpose's configured TTL, and
+   * persists it via replaceAccountActionToken, which atomically
+   * removes any previously-live token for the same user+purpose (the
+   * DB's unique index allows only one live token per user per purpose)
+   * and inserts the new row in a single transaction.
    *
    * @param userId Account the token is being issued for.
    * @param purpose Which flow this token authorizes — `activation` or
@@ -216,11 +232,6 @@ export class AuthService {
     userId: string,
     purpose: AccountTokenPurposeEnum,
   ): Promise<string> {
-    // Invalidate any existing unused token for this user+purpose first,
-    // so the insert below never collides with
-    // uq_account_action_token_live_per_purpose.
-    await this.authRepository.invalidateLiveToken(userId, purpose);
-
     const rawToken = crypto.randomBytes(32).toString('hex');
     const tokenHash = this.hashToken(rawToken);
 
@@ -235,7 +246,7 @@ export class AuthService {
       expires_at: expiresAt,
     };
 
-    await this.authRepository.createAccountActionToken(data);
+    await this.authRepository.replaceAccountActionToken(data);
 
     return rawToken;
   }
@@ -291,6 +302,145 @@ export class AuthService {
   }
 
   /**
+   * Issues a password-reset token for an already-active account and
+   * emails the reset link (admin-forced reset, e.g. compromise
+   * response). Mirror image of createActivationToken: the account
+   * must be `active`, not pending.
+   *
+   * NOTE: this only issues the link. It does not touch the current
+   * password or sessions — those change when the holder actually
+   * redeems the link (see resetPassword).
+   *
+   * @param userId The account to reset. Must currently be `active`.
+   * @param email Address to send the reset link to.
+   * @throws {BadRequestException} If the account doesn't exist or is
+   *   not `active`.
+   */
+  async createPasswordResetToken(userId: string, email: string): Promise<void> {
+    const state = await this.authRepository.checkUserActivationState(userId);
+
+    if (!state || state.account_status !== AccountStatusEnum.ACTIVE) {
+      this.logger.warn(
+        `Password reset requested for non-active account: ${userId}`,
+      );
+      throw new BadRequestException('Account is not active.');
+    }
+
+    try {
+      const rawToken = await this.generateActionToken(
+        userId,
+        AccountTokenPurposeEnum.PASSWORD_RESET,
+      );
+
+      await this.emailService.sendPasswordResetEmail(email, rawToken);
+    } catch (err: unknown) {
+      this.logger.error(
+        `Failed to create/send password reset token for user ${userId}`,
+        err instanceof Error ? err.stack : err,
+      );
+      throw new InternalServerErrorException(
+        'Failed to send password reset email.',
+      );
+    }
+  }
+
+  /**
+   * "j***@domain.com". The API owns masking so the SPA never sees a
+   * full address before the holder has proven they own the link.
+   */
+  private maskEmail(email: string): string {
+    const [local, domain] = email.split('@');
+    if (!local || !domain) return '***';
+    return `${local[0]}***@${domain}`;
+  }
+
+  /**
+   * Shared by both GET verify endpoints. Confirms the raw token from
+   * the link is live, matches the given purpose, and belongs to an
+   * account in the right state, then returns only a masked email.
+   *
+   * @throws {BadRequestException} With a single generic message for
+   *   every failure reason.
+   */
+  private async verifyActionToken(
+    rawToken: string,
+    purpose: AccountTokenPurposeEnum,
+  ): Promise<{ maskedEmail: string }> {
+    const tokenHash = this.hashToken(rawToken);
+    const match = await this.authRepository.findLiveTokenWithUser(
+      tokenHash,
+      purpose,
+    );
+
+    if (!match) {
+      throw new BadRequestException(INVALID_LINK_MESSAGE);
+    }
+
+    return { maskedEmail: this.maskEmail(match.email) };
+  }
+
+  async verifyActivationToken(
+    rawToken: string,
+  ): Promise<{ maskedEmail: string }> {
+    return this.verifyActionToken(rawToken, AccountTokenPurposeEnum.ACTIVATION);
+  }
+
+  async verifyPasswordResetToken(
+    rawToken: string,
+  ): Promise<{ maskedEmail: string }> {
+    return this.verifyActionToken(
+      rawToken,
+      AccountTokenPurposeEnum.PASSWORD_RESET,
+    );
+  }
+
+  /**
+   * Shared by both POST submit endpoints. Hashes the new password and
+   * redeems the token in one repository transaction (token marked
+   * used, password set, account active, sessions dropped). The
+   * password's strength rules are the DTO's job — by the time it gets
+   * here it is trusted.
+   *
+   * @throws {BadRequestException} If the token is no longer valid.
+   */
+  private async redeemActionToken(
+    rawToken: string,
+    newPassword: string,
+    purpose: AccountTokenPurposeEnum,
+  ): Promise<void> {
+    const tokenHash = this.hashToken(rawToken);
+    const passwordHash = await bcrypt.hash(newPassword, BCRYPT_SALT_ROUNDS);
+
+    const result = await this.authRepository.consumeTokenAndSetPassword(
+      tokenHash,
+      purpose,
+      passwordHash,
+    );
+
+    if (!result) {
+      throw new BadRequestException(INVALID_LINK_MESSAGE);
+    }
+  }
+
+  /** Sets the first password on a pending_activation account. */
+  async activateAccount(rawToken: string, newPassword: string): Promise<void> {
+    await this.redeemActionToken(
+      rawToken,
+      newPassword,
+      AccountTokenPurposeEnum.ACTIVATION,
+    );
+  }
+
+  /** Replaces the password on an active account via a reset link. */
+  async resetPassword(rawToken: string, newPassword: string): Promise<void> {
+    await this.redeemActionToken(
+      rawToken,
+      newPassword,
+      AccountTokenPurposeEnum.PASSWORD_RESET,
+    );
+  }
+
+  /**
    * Rotates a refresh session atomically: signs a new token pair, then
    * persists it via atomicSession, which — in a single DB transaction —
    * removes the old session (by user_id for non-SUPER roles, by exact
@@ -341,6 +491,48 @@ export class AuthService {
       }
       this.logger.error('Error during token refresh', err);
       throw new InternalServerErrorException('Token refresh failed.');
+    }
+  }
+
+  async googleLogin(socialIdToken: string): Promise<AuthTokens> {
+    try {
+      const googleIdentity =
+        await this.googleService.verifyIdToken(socialIdToken);
+
+      const user = await this.authRepository.findUserBySocialIdentity(
+        googleIdentity.googleId,
+        AuthProviderEnum.GOOGLE,
+      );
+
+      if (!user) {
+        this.logger.warn(
+          `Unregistered Google identity attempted login: ${googleIdentity.email}`,
+        );
+        throw new NotFoundException('Account not found.');
+      }
+
+      if (user.deleted_at !== null) {
+        this.logger.warn(
+          `Deactivated Google user attempted login: ${googleIdentity.email}`,
+        );
+        throw new UnauthorizedException('Account deactivated.');
+      }
+
+      return await this.generateTokens(
+        user.id,
+        user.role,
+        user.command_center_id,
+      );
+    } catch (err) {
+      if (
+        err instanceof NotFoundException ||
+        err instanceof UnauthorizedException
+      ) {
+        throw err;
+      }
+
+      this.logger.error('Error during Google authentication', err);
+      throw new InternalServerErrorException('Google authentication failed.');
     }
   }
 }

@@ -1,4 +1,4 @@
-export enum ServiceProvider {
+export enum ServiceProviderEnum {
   ANGKAS = 'angkas',
   MOVE_IT = 'move_it',
   JOYRIDE = 'joyride',

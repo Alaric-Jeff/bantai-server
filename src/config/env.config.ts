@@ -157,7 +157,7 @@ class EnvironmentVariables {
   // ---------------- Resend ----------------
   @IsString()
   @IsNotEmpty()
-  bantai_resend_api_key!: string;
+  RESEND_API_KEY!: string;
 }
 
 export function validate(

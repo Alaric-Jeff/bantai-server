@@ -7,6 +7,8 @@ import { AuthModule } from './modules/auth/auth.module';
 import { CommandCenterModule } from './modules/command-center/command-center.module';
 import { EmailModule } from './modules/email/email.module';
 import { validate } from './config/env.config';
+import { RespondersModule } from './modules/responders/responders.module';
+import { DriverModule } from './modules/drivers/drivers.module';
 
 @Module({
   imports: [
@@ -18,6 +20,8 @@ import { validate } from './config/env.config';
     AuthModule,
     CommandCenterModule,
     EmailModule,
+    RespondersModule,
+    DriverModule,
   ],
   controllers: [AppController],
   providers: [AppService],

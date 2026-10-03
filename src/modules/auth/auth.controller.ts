@@ -20,7 +20,7 @@ import { EmailPasswordDto } from './dto/email-password.dto';
 import { ActionTokenPasswordDto } from './dto/action-token-password.dto';
 import { ReplyWithCookie } from './interfaces/reply-w-cookie.interface';
 import { AuthTokens } from './interfaces/auth-token.interface';
-import { GoogleLoginDto } from './dto/google-sso.dto';
+import { GoogleSsoDto } from './dto/google-sso.dto';
 
 interface RequestWithCookies extends FastifyRequest {
   cookies: Record<string, string | undefined>;
@@ -61,10 +61,10 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   @Post('google')
   async googleSignIn(
-    @Body() dto: GoogleLoginDto,
+    @Body() dto: GoogleSsoDto,
     @Res({ passthrough: true }) response: FastifyReply,
   ): Promise<AuthTokens> {
-    const tokens = await this.authService.googleLogin(dto.social_id_token);
+    const tokens = await this.authService.googleLogin(dto.idToken);
 
     this.setRefreshTokenCookie(response, tokens.refreshToken);
 
@@ -92,11 +92,6 @@ export class AuthController {
 
   // ------------------------------------------------------------------
   // Emailed-link flows (account activation / password reset).
-  //
-  // Public on purpose: the holder has no session yet, and the
-  // single-use token IS the credential. Responses are no-store so a
-  // token-bearing URL or its result is never cached by a browser or
-  // proxy.
   // ------------------------------------------------------------------
 
   @Get('verify-activation-token')
@@ -139,11 +134,6 @@ export class AuthController {
     return { message: 'Password reset.' };
   }
 
-  /**
-   * A missing, non-string, or absurdly long ?token= gets the same
-   * generic message as an expired link, so the response never hints
-   * at what was wrong with it.
-   */
   private requireActionToken(token: unknown): string {
     if (
       typeof token !== 'string' ||

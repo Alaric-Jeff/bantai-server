@@ -5,6 +5,7 @@ import {
   InternalServerErrorException,
   BadRequestException,
   NotFoundException,
+  ConflictException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
@@ -29,27 +30,14 @@ interface SignedTokens extends AuthTokens {
   refreshExpiresAt: Date;
 }
 
-/**
- * Maps each account-action token purpose to the config key holding
- * its TTL. Keeping this as a lookup (rather than branching in code)
- * means adding a new purpose later is a one-line addition here plus
- * a new .env key — no new if/switch needed.
- */
 const TOKEN_TTL_CONFIG_KEY: Record<AccountTokenPurposeEnum, string> = {
   [AccountTokenPurposeEnum.ACTIVATION]: 'ACTIVATION_TOKEN_EXPIRATION',
   [AccountTokenPurposeEnum.PASSWORD_RESET]: 'PASSWORD_RESET_TOKEN_EXPIRATION',
 };
 
-/**
- * One generic message for every way a link can be unusable (unknown,
- * expired, already used, wrong purpose, wrong account state). The SPA
- * shows this text as-is, and being vague means the endpoint can't be
- * used to probe which tokens or accounts exist.
- */
 export const INVALID_LINK_MESSAGE =
   'This link has expired or has already been used.';
 
-// Match whatever cost factor the rest of the app uses for bcrypt.
 const BCRYPT_SALT_ROUNDS = 12;
 
 @Injectable()
@@ -76,36 +64,10 @@ export class AuthService {
     };
   }
 
-  /**
-   * Fast, deterministic hash used for both refresh tokens and account
-   * action tokens. SHA-256 (not bcrypt/argon2) is correct here because
-   * the input is a high-entropy random secret, not a low-entropy
-   * user-chosen password — there's nothing to slow down an attacker
-   * guessing, so a fast hash keeps lookups cheap without any security
-   * trade-off.
-   */
   private hashToken(token: string): string {
     return crypto.createHash('sha256').update(token).digest('hex');
   }
 
-  /**
-   * Pure token signing — no DB writes. Produces a fresh access/refresh
-   * pair plus the refresh token's hash and expiry, so callers can decide
-   * how to persist the session (a plain insert for a new login, or an
-   * atomic rotate-in-transaction for a refresh).
-   *
-   * The refresh token payload includes a random `jti` (JWT ID). Without
-   * it, two refresh tokens signed for the same user within the same
-   * wall-clock second are byte-for-byte IDENTICAL: the JWT `iat` claim
-   * only has 1-second resolution, HS256 signing is fully deterministic
-   * (no randomness), and the payload was otherwise just `{ sub: userId }`.
-   * That meant a login followed by an immediate refresh (or two refreshes
-   * within the same second) could produce the exact same token twice,
-   * silently defeating rotation — the "new" session would hash-collide
-   * with the "old" one instead of being a genuinely distinct credential.
-   * A random UUID per signing call guarantees uniqueness regardless of
-   * timing, with no other behavior change.
-   */
   private async signTokens(
     userId: string,
     role: Role,
@@ -211,23 +173,6 @@ export class AuthService {
     }
   }
 
-  /**
-   * Core token-issuing routine shared by both activation and
-   * password-reset flows. Generates a random raw secret, hashes it for
-   * storage, computes expiry from the purpose's configured TTL, and
-   * persists it via replaceAccountActionToken, which atomically
-   * removes any previously-live token for the same user+purpose (the
-   * DB's unique index allows only one live token per user per purpose)
-   * and inserts the new row in a single transaction.
-   *
-   * @param userId Account the token is being issued for.
-   * @param purpose Which flow this token authorizes — `activation` or
-   *   `password_reset`. Determines both the TTL config key used here
-   *   and, at redemption time, which state transition is valid.
-   * @returns The RAW (unhashed) token. This is the only value that
-   *   should ever be emailed to the user — it is never persisted
-   *   anywhere itself, only its SHA-256 hash is.
-   */
   private async generateActionToken(
     userId: string,
     purpose: AccountTokenPurposeEnum,
@@ -251,25 +196,6 @@ export class AuthService {
     return rawToken;
   }
 
-  /**
-   * Issues an activation token for a `pending_activation` account and
-   * emails the activation link to the account holder. This is the
-   * only way a provisioned admin/responder/super account can ever
-   * receive a password — there is no temporary password generated
-   * anywhere in this flow.
-   *
-   * Called immediately after account provisioning (e.g. an admin
-   * creating a responder via user_account + r_profile), which is why
-   * this takes `email` directly rather than looking it up — the
-   * caller already has it from the `INSERT ... RETURNING id` +
-   * creation DTO, so no extra DB round-trip is needed here.
-   *
-   * @param userId The freshly-provisioned account's id. Must
-   *   currently be in `pending_activation` status.
-   * @param email Address to send the activation link to.
-   * @throws {BadRequestException} If the account doesn't exist or is
-   *   not in `pending_activation` status.
-   */
   async createActivationToken(userId: string, email: string): Promise<void> {
     const state = await this.authRepository.checkUserActivationState(userId);
 
@@ -301,21 +227,6 @@ export class AuthService {
     }
   }
 
-  /**
-   * Issues a password-reset token for an already-active account and
-   * emails the reset link (admin-forced reset, e.g. compromise
-   * response). Mirror image of createActivationToken: the account
-   * must be `active`, not pending.
-   *
-   * NOTE: this only issues the link. It does not touch the current
-   * password or sessions — those change when the holder actually
-   * redeems the link (see resetPassword).
-   *
-   * @param userId The account to reset. Must currently be `active`.
-   * @param email Address to send the reset link to.
-   * @throws {BadRequestException} If the account doesn't exist or is
-   *   not `active`.
-   */
   async createPasswordResetToken(userId: string, email: string): Promise<void> {
     const state = await this.authRepository.checkUserActivationState(userId);
 
@@ -344,24 +255,12 @@ export class AuthService {
     }
   }
 
-  /**
-   * "j***@domain.com". The API owns masking so the SPA never sees a
-   * full address before the holder has proven they own the link.
-   */
   private maskEmail(email: string): string {
     const [local, domain] = email.split('@');
     if (!local || !domain) return '***';
     return `${local[0]}***@${domain}`;
   }
 
-  /**
-   * Shared by both GET verify endpoints. Confirms the raw token from
-   * the link is live, matches the given purpose, and belongs to an
-   * account in the right state, then returns only a masked email.
-   *
-   * @throws {BadRequestException} With a single generic message for
-   *   every failure reason.
-   */
   private async verifyActionToken(
     rawToken: string,
     purpose: AccountTokenPurposeEnum,
@@ -394,15 +293,6 @@ export class AuthService {
     );
   }
 
-  /**
-   * Shared by both POST submit endpoints. Hashes the new password and
-   * redeems the token in one repository transaction (token marked
-   * used, password set, account active, sessions dropped). The
-   * password's strength rules are the DTO's job — by the time it gets
-   * here it is trusted.
-   *
-   * @throws {BadRequestException} If the token is no longer valid.
-   */
   private async redeemActionToken(
     rawToken: string,
     newPassword: string,
@@ -422,7 +312,6 @@ export class AuthService {
     }
   }
 
-  /** Sets the first password on a pending_activation account. */
   async activateAccount(rawToken: string, newPassword: string): Promise<void> {
     await this.redeemActionToken(
       rawToken,
@@ -431,7 +320,6 @@ export class AuthService {
     );
   }
 
-  /** Replaces the password on an active account via a reset link. */
   async resetPassword(rawToken: string, newPassword: string): Promise<void> {
     await this.redeemActionToken(
       rawToken,
@@ -440,16 +328,6 @@ export class AuthService {
     );
   }
 
-  /**
-   * Rotates a refresh session atomically: signs a new token pair, then
-   * persists it via atomicSession, which — in a single DB transaction —
-   * removes the old session (by user_id for non-SUPER roles, by exact
-   * oldHash for SUPER, see auth.repository.ts for why) and inserts the
-   * new one. Either both the delete and the insert land, or neither
-   * does, so a mid-operation failure can never leave the user without
-   * any valid session, nor leave two sessions behind for a role that's
-   * supposed to be single-session.
-   */
   async refreshToken(token: string): Promise<AuthTokens> {
     try {
       await this.jwtService.verifyAsync(token, {
@@ -511,12 +389,19 @@ export class AuthService {
         throw new NotFoundException('Account not found.');
       }
 
+      // Check account soft-delete status BEFORE writing last_sign_in_at to DB
       if (user.deleted_at !== null) {
         this.logger.warn(
           `Deactivated Google user attempted login: ${googleIdentity.email}`,
         );
         throw new UnauthorizedException('Account deactivated.');
       }
+
+      await this.authRepository.updateIdentityLastSignIn(
+        user.id,
+        AuthProviderEnum.GOOGLE,
+        googleIdentity.googleId,
+      );
 
       return await this.generateTokens(
         user.id,
@@ -533,6 +418,93 @@ export class AuthService {
 
       this.logger.error('Error during Google authentication', err);
       throw new InternalServerErrorException('Google authentication failed.');
+    }
+  }
+
+  async linkSocialAccount(
+    userId: string,
+    provider: AuthProviderEnum,
+    socialIdToken: string,
+  ): Promise<void> {
+    if (provider === AuthProviderEnum.LOCAL) {
+      throw new BadRequestException(
+        'Use password update to configure local authentication.',
+      );
+    }
+
+    let providerId: string;
+    let email: string;
+
+    if (provider === AuthProviderEnum.GOOGLE) {
+      const verified = await this.googleService.verifyIdToken(socialIdToken);
+      providerId = verified.googleId;
+      email = verified.email;
+    } else {
+      throw new BadRequestException(
+        `Provider ${provider} is not supported for linking.`,
+      );
+    }
+
+    const existingUser = await this.authRepository.findUserBySocialIdentity(
+      providerId,
+      provider,
+    );
+
+    if (existingUser) {
+      if (existingUser.id === userId) {
+        throw new ConflictException(
+          'This account is already linked to your profile.',
+        );
+      }
+      throw new ConflictException(
+        'This social account is already linked to another user.',
+      );
+    }
+
+    try {
+      await this.authRepository.linkUserIdentity(
+        userId,
+        provider,
+        providerId,
+        email,
+      );
+    } catch (err: unknown) {
+      this.logger.error(
+        `Failed to link ${provider} identity for user ${userId}`,
+        err,
+      );
+      throw new InternalServerErrorException(
+        'Failed to link identity provider.',
+      );
+    }
+  }
+
+  async unlinkSocialAccount(
+    userId: string,
+    provider: AuthProviderEnum,
+  ): Promise<void> {
+    if (provider === AuthProviderEnum.LOCAL) {
+      throw new BadRequestException('Cannot unlink local provider.');
+    }
+
+    const { hasPassword, linkedProvidersCount } =
+      await this.authRepository.getUserAuthSummary(userId);
+
+    if (!hasPassword && linkedProvidersCount <= 1) {
+      throw new BadRequestException(
+        'Cannot unlink your only sign-in method. Set a password or link another provider first.',
+      );
+    }
+
+    const unlinked = await this.authRepository.unlinkUserIdentity(
+      userId,
+      provider,
+    );
+
+    if (!unlinked) {
+      throw new NotFoundException(
+        `No active ${provider} identity found to unlink.`,
+      );
     }
   }
 }

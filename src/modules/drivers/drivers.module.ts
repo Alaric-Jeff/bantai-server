@@ -4,7 +4,10 @@ import { DriverService } from './drivers.service';
 import { DriverRepository } from './drivers.repository';
 import { AuthModule } from '../auth/auth.module';
 import { AuthProviderEnum } from '../responders/enums/auth-provider.enum';
-import { SOCIAL_IDENTITY_VERIFIERS } from './types/social-identity-provider.type';
+import {
+  SOCIAL_IDENTITY_VERIFIERS,
+  SocialIdentityVerifiers,
+} from './types/social-identity-provider.type';
 import { GoogleService } from '../auth/providers/google.service';
 
 @Module({
@@ -15,9 +18,15 @@ import { GoogleService } from '../auth/providers/google.service';
     DriverRepository,
     {
       provide: SOCIAL_IDENTITY_VERIFIERS,
-      useFactory: (googleService: GoogleService) => ({
+      useFactory: (googleService: GoogleService): SocialIdentityVerifiers => ({
         [AuthProviderEnum.GOOGLE]: {
-          verify: (idToken: string) => googleService.verifyIdToken(idToken),
+          verify: async (idToken: string) => {
+            const payload = await googleService.verifyIdToken(idToken);
+            return {
+              provider_id: payload.googleId,
+              email: payload.email,
+            };
+          },
         },
         [AuthProviderEnum.APPLE]: {
           verify: () => {

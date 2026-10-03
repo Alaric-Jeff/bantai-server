@@ -252,7 +252,7 @@ export class CreateDriverDto {
   data_sharing_consent!: boolean;
 
   // ---------------------------------------------------------------
-  // Screen 6: Phone verification
+  // Screen 6: Phone verification -> this is nothing, not required
   // ---------------------------------------------------------------
   @Matches(OTP_PATTERN, { message: 'otp_code must be a 6-digit code' })
   otp_code!: string;

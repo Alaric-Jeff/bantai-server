@@ -1,6 +1,5 @@
 import { Role } from '../../../common/enums/role-enum';
 import { AccountStatusEnum } from '../../auth/enums/account-status.enum';
-import { AuthProviderEnum } from '../../responders/enums/auth-provider.enum';
 
 export interface UserAccountEntity {
   id: string;
@@ -13,8 +12,8 @@ export interface UserAccountEntity {
   command_center_id: string | null;
 
   avatar_url: string | null;
-  auth_provider: AuthProviderEnum;
-  provider_id: string | null;
+  // auth_provider: AuthProviderEnum;
+  // provider_id: string | null; both are deprecated
   password_hash: string | null;
   account_status: AccountStatusEnum;
 

@@ -29,27 +29,60 @@ export class SeederService implements OnApplicationBootstrap {
     }
 
     try {
-      const existingUser = await this.db.query(
-        'SELECT id FROM user_account WHERE email = $1 OR role = $2 LIMIT 1',
-        [email, Role.SUPER],
-      );
+      await this.db.withTransaction(async (client) => {
+        // 1. Idempotency Check using typed rows
+        const existingUser = await client.query<{ id: string }>(
+          'SELECT id FROM user_account WHERE email = $1 OR role = $2 LIMIT 1',
+          [email, Role.SUPER],
+        );
 
-      if (existingUser.rowCount && existingUser.rowCount > 0) {
-        this.logger.log('Superadmin account already present. Skipping seed.');
-        return;
-      }
+        if (existingUser.rows.length > 0) {
+          this.logger.log('Superadmin account already present. Skipping seed.');
+          return;
+        }
 
-      const saltRounds = 12;
-      const hashedPassword = await bcrypt.hash(rawPassword, saltRounds);
+        const saltRounds = 12;
+        const hashedPassword = await bcrypt.hash(rawPassword, saltRounds);
 
-      await this.db.query(
-        `INSERT INTO user_account (email, password_hash, role, f_name, l_name, m_number)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (email) DO NOTHING`,
-        [email, hashedPassword, Role.SUPER, 'Super', 'Admin', '+639763172042'],
-      );
+        // 2. Insert into user_account with pre-verified timestamps and return generated UUID
+        const userResult = await client.query<{ id: string }>(
+          `INSERT INTO user_account (
+             email,
+             password_hash,
+             role,
+             f_name,
+             l_name,
+             m_number,
+             account_status,
+             email_verified_at,
+             phone_verified_at
+           )
+           VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+           RETURNING id`,
+          [
+            email,
+            hashedPassword,
+            Role.SUPER,
+            'Super',
+            'Admin',
+            '+639763172042',
+            'active',
+          ],
+        );
 
-      this.logger.log(`Superadmin account seeded successfully: ${email}`);
+        const userId = userResult.rows[0].id;
+
+        // 3. Create initial user_identity row (Migration 006 compliant)
+        await client.query(
+          `INSERT INTO user_identity (
+             user_id, provider, provider_id, provider_email
+           )
+           VALUES ($1, $2, $3, $4)`,
+          [userId, 'local', userId, email],
+        );
+
+        this.logger.log(`Superadmin account seeded successfully: ${email}`);
+      });
     } catch (error: unknown) {
       const errorMessage =
         error instanceof Error ? error.message : 'Unknown error during seeding';

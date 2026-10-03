@@ -1,7 +1,7 @@
 import { IsNotEmpty, IsString } from 'class-validator';
 
-export class GoogleLoginDto {
+export class GoogleSsoDto {
   @IsString()
-  @IsNotEmpty({ message: 'social_id_token is required' })
-  social_id_token!: string;
+  @IsNotEmpty()
+  idToken!: string;
 }

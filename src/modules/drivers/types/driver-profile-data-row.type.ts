@@ -27,8 +27,8 @@ export type DriverProfileDataRow = Pick<
   | 'l_name'
   | 'email'
   | 'm_number'
-  | 'avatar_url'
-  | 'auth_provider'
+  // | 'avatar_url'
+  // | 'auth_provider'
   | 'phone_verified_at'
 > &
   Pick<

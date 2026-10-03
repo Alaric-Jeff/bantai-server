@@ -42,16 +42,14 @@ const PROFILE_PATCHABLE_COLUMNS: readonly (keyof DriverProfilePatch)[] = [
 ];
 
 /**
- * The driver's profile: user_account + d_profile, exactly the
- * columns of DriverProfileDataRow. Dates are formatted in SQL because
- * node-pg would otherwise return a JS Date at local midnight, which
- * shifts the day in timezones ahead of UTC (e.g. Manila).
- * password_hash and provider_id are never selected.
+ * The driver's profile: user_account + d_profile, matching DriverProfileDataRow.
+ * Dates are formatted in SQL to prevent timezone shifts during serialization.
+ * Migration 006: u.auth_provider and u.provider_id are removed from user_account.
  */
 const PROFILE_SELECT_SQL = `
   SELECT
     u.id, u.f_name, u.m_name, u.l_name, u.email, u.m_number, u.avatar_url,
-    u.auth_provider, u.phone_verified_at,
+    u.phone_verified_at,
     p.service_provider, p.service_id, p.fleet_operator_id, p.plate_number,
     p.blood_type, p.address,
     to_char(p.date_of_birth, 'YYYY-MM-DD') AS date_of_birth,
@@ -71,9 +69,7 @@ export class DriverRepository {
   constructor(private readonly db: DatabaseService) {}
 
   /**
-   * Creates user_account + d_profile together in ONE transaction.
-   * Unlike ResponderRepository's createResponderProfile, profileData
-   * is never optional here...
+   * Creates user_account, optional user_identity, and d_profile inside ONE transaction.
    */
   async createDriverAccount(
     userData: CreateDriverUserAccount,
@@ -111,12 +107,13 @@ export class DriverRepository {
     } = profileData;
 
     return this.db.withTransaction(async (client) => {
+      // 1. Insert core user_account (decoupled from auth provider metadata)
       const { rows } = await client.query<UserIdType>(
-        `INSERT INTO user_account(
+        `INSERT INTO user_account (
            f_name, l_name, m_name, email, m_number, role,
-           auth_provider, provider_id, password_hash, phone_verified_at, email_verified_at
+           password_hash, phone_verified_at, email_verified_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          RETURNING id`,
         [
           f_name,
@@ -125,8 +122,6 @@ export class DriverRepository {
           email,
           m_number,
           Role.DRIVER,
-          auth_provider,
-          provider_id,
           password_hash,
           phone_verified_at,
           email_verified_at,
@@ -134,12 +129,22 @@ export class DriverRepository {
       );
       const { id: user_id } = rows[0];
 
+      // 2. Insert into user_identity if social identity is supplied
+      if (auth_provider && provider_id) {
+        await client.query(
+          `INSERT INTO user_identity (user_id, provider, provider_id, provider_email)
+           VALUES ($1, $2, $3, $4)`,
+          [user_id, auth_provider, provider_id, email],
+        );
+      }
+
+      // 3. Insert driver profile metadata
       await client.query(
-        `INSERT INTO d_profile(
+        `INSERT INTO d_profile (
            user_id, service_provider, service_id, plate_number, blood_type,
            address, date_of_birth, emergency_contacts, license_number,
            license_expires_at, years_riding, fleet_operator_id,
-           vehicle_model, vehicle_color, medical_conditions, data_sharing_consented_a
+           vehicle_model, vehicle_color, medical_conditions, data_sharing_consented_at
          )
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
         [
@@ -167,9 +172,7 @@ export class DriverRepository {
   }
 
   /**
-   * The driver's whole profile in one query, or null if there is no
-   * active (not soft-deleted) driver with this id. Pass `client` to
-   * read inside an open transaction.
+   * Fetches full driver profile or null if account is inactive or deleted.
    */
   async findProfileById(
     userId: string,
@@ -184,15 +187,7 @@ export class DriverRepository {
   }
 
   /**
-   * Updates only the keys present in the patch. Returns true only if
-   * a row was actually updated (false for an empty patch, an unknown
-   * id, a non-driver, or a soft-deleted account).
-   *
-   * Changing m_number clears phone_verified_at, unless the patch
-   * carries its own phone_verified_at (the new number was verified in
-   * the same request). The comparison runs in SQL against the OLD
-   * value, atomically, so re-sending the same number does not
-   * un-verify it. updated_at is maintained by the table trigger.
+   * Updates user_account table based on defined patch columns.
    */
   async updateUserAccount(
     userId: string,
@@ -230,10 +225,7 @@ export class DriverRepository {
   }
 
   /**
-   * Updates only the keys present in the patch. Returns true only if
-   * a row was actually updated. The owning account must not be
-   * soft-deleted. emergency_contacts is stringified and cast to
-   * jsonb (node-pg would otherwise send an array as a Postgres ARRAY).
+   * Updates d_profile table based on defined patch columns.
    */
   async updateDriverProfile(
     userId: string,
@@ -265,14 +257,7 @@ export class DriverRepository {
   }
 
   /**
-   * Applies both patches in ONE transaction and returns the fresh
-   * profile read back inside it, so the caller can hand the app the
-   * new full record instead of making it refetch. The user row is
-   * locked first, so concurrent edits serialize. Returns null (and
-   * writes nothing) if there is no active driver with this id.
-   *
-   * Postgres errors (23502, 23514, class 22) pass through for the
-   * service to translate.
+   * Applies both patches in ONE transaction and returns updated record.
    */
   async patchDriverComposite(
     userId: string,
@@ -295,12 +280,6 @@ export class DriverRepository {
     });
   }
 
-  /**
-   * Emits `"column" = $n` for each allow-listed column the patch
-   * actually carries (`undefined` = leave alone; `null` is a real
-   * value). Appends the values to `params` and reports which
-   * placeholder each column got.
-   */
   private collectAssignments(
     patch: object,
     columns: readonly string[],

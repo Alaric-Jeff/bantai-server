@@ -28,7 +28,6 @@ import {
   type SocialIdentityVerifiers,
 } from './types/social-identity-provider.type';
 
-/** The identity-related columns that differ per auth provider. */
 type IdentityFields = Pick<
   CreateDriverUserAccount,
   | 'email'
@@ -40,11 +39,9 @@ type IdentityFields = Pick<
 
 const BCRYPT_ROUNDS = 12;
 
-// Postgres SQLSTATE codes we translate into HTTP errors.
 const PG_UNIQUE_VIOLATION = '23505';
 const PG_CHECK_VIOLATION = '23514';
 const PG_NOT_NULL_VIOLATION = '23502';
-// Class 22 = data exceptions (value too long, invalid format, out of range).
 const PG_DATA_EXCEPTION_CLASS = '22';
 
 interface PgErrorLike {
@@ -60,7 +57,6 @@ function hasChanges(patch: object): boolean {
   return Object.values(patch).some((value) => value !== undefined);
 }
 
-/** 'YYYY-MM-DD' (already strictly validated by the DTO) strictly before now. */
 function isPastDate(isoDate: string): boolean {
   return new Date(`${isoDate}T00:00:00.000Z`).getTime() < Date.now();
 }
@@ -75,18 +71,6 @@ export class DriverService {
     private readonly socialVerifiers: SocialIdentityVerifiers,
   ) {}
 
-  /**
-   * Registers a driver. Called once the whole wizard is complete;
-   * user_account + d_profile are inserted in a single transaction by the
-   * repository.
-   *
-   * `phoneVerifiedAt` must come from your OTP layer (the controller
-   * verifies dto.otp_code first), never from the request body.
-   *
-   * Provider-agnostic: everything that differs between email/password,
-   * Google and Apple lives in resolveIdentity(); the rest of the flow is
-   * identical for all of them.
-   */
   async createDriver(
     dto: CreateDriverDto,
     phoneVerifiedAt: Date,
@@ -117,7 +101,6 @@ export class DriverService {
 
     const profileData: CreateDriverProfileData = {
       service_provider: dto.service_provider,
-      // service_id_requires_provider: null for independent, a value otherwise.
       service_id:
         dto.service_provider === ServiceProviderEnum.INDEPENDENT
           ? null
@@ -134,7 +117,6 @@ export class DriverService {
       vehicle_model: dto.vehicle_model,
       vehicle_color: dto.vehicle_color,
       medical_conditions: dto.medical_conditions,
-      // Stamped server-side so the audit trail can't be client-supplied.
       data_sharing_consented_at: new Date(),
     };
 
@@ -148,14 +130,6 @@ export class DriverService {
     }
   }
 
-  /**
-   * Partial update of the authenticated driver's account + profile.
-   * Returns the fresh full profile.
-   *
-   * `phoneVerifiedAt` is required whenever dto.m_number is present: the
-   * controller verifies dto.otp_code and passes the result here. (If a
-   * number changes without it, the repository would clear verification.)
-   */
   async updateProfile(
     userId: string,
     dto: PatchDriverProfileDto,
@@ -184,7 +158,6 @@ export class DriverService {
       throw new BadRequestException('date_of_birth must be in the past');
     }
 
-    // Switching to independent drops the platform id automatically.
     if (profilePatch.service_provider === ServiceProviderEnum.INDEPENDENT) {
       profilePatch.service_id = null;
     }
@@ -206,13 +179,6 @@ export class DriverService {
     return profile;
   }
 
-  /**
-   * Turns the registration's credentials into the identity columns
-   * (chck_auth_requirements): a local driver has password_hash and a null
-   * provider_id; a Google/Apple driver has a provider_id and no password.
-   * For social providers the email comes from the VERIFIED token, never
-   * from the request body.
-   */
   private async resolveIdentity(dto: CreateDriverDto): Promise<IdentityFields> {
     switch (dto.auth_provider) {
       case AuthProviderEnum.LOCAL: {
@@ -220,7 +186,7 @@ export class DriverService {
           throw new BadRequestException('Password is required');
         }
         return {
-          email: dto.email,
+          email: dto.email.trim().toLowerCase(),
           auth_provider: AuthProviderEnum.LOCAL,
           provider_id: null,
           password_hash: await bcrypt.hash(dto.password, BCRYPT_ROUNDS),
@@ -259,10 +225,6 @@ export class DriverService {
     }
   }
 
-  /**
-   * Translates Postgres errors into HTTP exceptions. Anything unexpected is
-   * logged (without request data, which contains PII) and surfaced as a 500.
-   */
   private rethrowDbError(error: unknown, operation: string): never {
     if (isPgError(error)) {
       if (error.code === PG_UNIQUE_VIOLATION) {
@@ -279,6 +241,14 @@ export class DriverService {
         }
         if (constraint.includes('license_number')) {
           throw new ConflictException('License number is already registered');
+        }
+        if (
+          constraint.includes('user_identity') ||
+          constraint.includes('provider')
+        ) {
+          throw new ConflictException(
+            'This social account is already registered',
+          );
         }
 
         throw new ConflictException(

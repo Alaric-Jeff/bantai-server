@@ -6,6 +6,8 @@ import { ActivationStateRow } from './interfaces/activation-state-row.interface'
 import { CreateActivationTokenData } from './types/create-activation-token.types';
 import { AccountTokenPurposeEnum } from './enums/account-token-purpose.enum';
 import { AuthProviderEnum } from '../responders/enums/auth-provider.enum';
+import { UpdatePasswordData } from './interfaces/update-password.interface';
+import { PasswordType } from './types/get-password.type';
 
 @Injectable()
 export class AuthRepository {
@@ -17,7 +19,7 @@ export class AuthRepository {
     const sql = `
       SELECT id, password_hash, role, account_status, deleted_at, command_center_id
       FROM user_account 
-      WHERE email = $1
+      WHERE email = $1 AND deleted_at IS NULL
       LIMIT 1;
     `;
 
@@ -27,11 +29,11 @@ export class AuthRepository {
 
   async findUserById(id: string): Promise<UserAuthRow | null> {
     const sql = `
-    SELECT id, email, password_hash, role, account_status, deleted_at, command_center_id
-    FROM user_account
-    WHERE id = $1
-    LIMIT 1;
-  `;
+      SELECT id, email, password_hash, role, account_status, deleted_at, command_center_id
+      FROM user_account
+      WHERE id = $1 AND deleted_at IS NULL
+      LIMIT 1;
+    `;
     const { rows } = await this.db.query<UserAuthRow>(sql, [id]);
     return rows[0] || null;
   }
@@ -61,7 +63,10 @@ export class AuthRepository {
       SELECT u.id, u.password_hash, u.role, u.deleted_at, u.command_center_id 
       FROM user_account u
       INNER JOIN user_session s ON u.id = s.user_id
-      WHERE s.refresh_token_hash = $1 AND s.expires_at > NOW() AND s.is_revoked = false AND u.deleted_at IS NULL
+      WHERE s.refresh_token_hash = $1 
+        AND s.expires_at > NOW() 
+        AND s.is_revoked = false 
+        AND u.deleted_at IS NULL
       LIMIT 1;
     `;
 
@@ -70,11 +75,10 @@ export class AuthRepository {
     return rows[0] || null;
   }
 
-  async deleteSessionByHash(hash: string) {
-    const sql = `DELETE from user_session WHERE refresh_token_hash = $1`;
+  async deleteSessionByHash(hash: string): Promise<void> {
+    const sql = `DELETE FROM user_session WHERE refresh_token_hash = $1`;
 
     await this.db.query(sql, [hash]);
-    return;
   }
 
   async checkUserActivationState(id: string): Promise<ActivationStateRow> {
@@ -88,10 +92,6 @@ export class AuthRepository {
    * the token is live AND the account is in the state that purpose
    * requires (activation -> pending_activation, reset -> active), so a
    * token can't be used against the wrong kind of account.
-   *
-   * @param tokenHash SHA-256 hash of the raw token from the link.
-   * @param purpose Which flow is asking; a token minted for the other
-   *   purpose will not match.
    */
   async findLiveTokenWithUser(
     tokenHash: string,
@@ -119,14 +119,22 @@ export class AuthRepository {
     return rows[0] || null;
   }
 
+  /**
+   * Looks up a user by third-party provider identity (e.g. Google, Apple)
+   * in the decoupled `user_identity` table.
+   */
   async findUserBySocialIdentity(
     providerId: string,
     authProvider: AuthProviderEnum,
   ): Promise<UserAuthRow | null> {
     const sql = `
-      SELECT id, password_hash, role, account_status, deleted_at, command_center_id
-      FROM user_account 
-      WHERE provider_id = $1 AND auth_provider = $2
+      SELECT u.id, u.password_hash, u.role, u.account_status, u.deleted_at, u.command_center_id
+      FROM user_account u
+      INNER JOIN user_identity i ON u.id = i.user_id
+      WHERE i.provider_id = $1 
+        AND i.provider = $2
+        AND i.deleted_at IS NULL
+        AND u.deleted_at IS NULL
       LIMIT 1;
     `;
 
@@ -140,16 +148,6 @@ export class AuthRepository {
   /**
    * Issues a new activation / reset token, replacing any live one for
    * the same user and purpose, in ONE transaction.
-   *
-   * - Locking the user row first serializes concurrent "resend" requests
-   *   so they can't race into `uq_account_action_token_live_per_purpose`.
-   * - Superseded tokens are deleted rather than stamped `used_at`, so
-   *   `used_at` only ever means "consumed by the holder".
-   * - Issuing a new token kills the previous link (e.g. after a "resend
-   *   email" request) instead of leaving two valid tokens outstanding,
-   *   per the migration's app-layer requirement.
-   * - Purposes are independent: replacing an `activation` token never
-   *   touches a `password_reset` token for the same user, and vice versa.
    */
   async replaceAccountActionToken(
     data: CreateActivationTokenData,
@@ -174,16 +172,7 @@ export class AuthRepository {
   }
 
   /**
-   * For the two POST submit endpoints. Everything that must be true
-   * together happens in one transaction: the token is locked and
-   * re-validated (so a double-click or replay can't use it twice),
-   * marked used, the password is set, the account is active, and all
-   * existing sessions are dropped (matters for compromise-response
-   * resets). Returns null if the token is no longer valid.
-   *
-   * password_hash and account_status must change together
-   * (chck_auth_requirements); setting 'active' is harmless for resets
-   * since those accounts are already active.
+   * For the two POST submit endpoints.
    */
   async consumeTokenAndSetPassword(
     tokenHash: string,
@@ -238,40 +227,7 @@ export class AuthRepository {
   }
 
   /**
-   * Atomically rotates a refresh session: inserts the new session and
-   * removes the old one in a single DB transaction. Either both writes
-   * land or neither does — this closes the gap where a crash between
-   * "create new" and "delete old" could leave duplicate/orphaned
-   * sessions, or (in a non-transactional ordering) leave the user
-   * without a valid session at all if the second write failed.
-   *
-   * BUSINESS RULE — single-session enforcement:
-   * Every role except SUPER is restricted to exactly one active session
-   * at a time (using the system from two devices at once doesn't make
-   * sense for a driver/responder/admin in this product). SUPER is the
-   * one deliberate exception, since the dev team shares that role for
-   * development and needs concurrent sessions across multiple machines.
-   *
-   * This is why the two branches below are NOT unified into one
-   * "delete by oldHash" query:
-   *   - non-SUPER: deletes ALL sessions for user_id, not just oldHash.
-   *     Since these roles should only ever have one session row to
-   *     begin with, this is equivalent to deleting oldHash in the
-   *     normal case, but is more defensive — it also cleans up any
-   *     stray duplicate rows that shouldn't exist but could appear from
-   *     a bug elsewhere, keeping the single-session invariant intact.
-   *   - SUPER: deletes ONLY the exact oldHash being rotated. Deleting
-   *     by user_id here would be wrong — it would silently log out
-   *     every other team member sharing the SUPER role just because
-   *     one of them refreshed their token.
-   *
-   * DO NOT "simplify" this by making both branches delete-by-hash or
-   * both delete-by-user_id — either change breaks one of the two rules
-   * above. If you need to change this logic, re-read this comment first.
-   *
-   * ASSUMES DatabaseService exposes withTransaction() (see
-   * database.service.ts) for running multiple statements atomically
-   * against a single connection.
+   * Atomically rotates a refresh session.
    */
   async atomicSession(
     userId: string,
@@ -298,5 +254,93 @@ export class AuthRepository {
         [userId, newHash, expiresAt],
       );
     });
+  }
+  async updateIdentityLastSignIn(
+    userId: string,
+    provider: AuthProviderEnum,
+    providerId: string,
+  ): Promise<void> {
+    const sql = `
+    UPDATE user_identity
+    SET last_sign_in_at = NOW()
+    WHERE user_id = $1 AND provider = $2 AND provider_id = $3 AND deleted_at IS NULL;
+  `;
+    await this.db.query(sql, [userId, provider, providerId]);
+  }
+
+  // auth.repository.ts
+
+  /**
+   * Inserts a new identity record linked to an existing user.
+   */
+  // auth.repository.ts
+  async linkUserIdentity(
+    userId: string,
+    provider: AuthProviderEnum,
+    providerId: string,
+    providerEmail: string,
+  ): Promise<void> {
+    const sql = `
+    INSERT INTO user_identity (user_id, provider, provider_id, provider_email)
+    VALUES ($1, $2, $3, $4);
+  `;
+    await this.db.query(sql, [userId, provider, providerId, providerEmail]);
+  }
+  /**
+   * Soft-deletes a linked social identity for a user.
+   */
+  async unlinkUserIdentity(
+    userId: string,
+    provider: AuthProviderEnum,
+  ): Promise<boolean> {
+    const sql = `
+    UPDATE user_identity
+    SET deleted_at = NOW()
+    WHERE user_id = $1 AND provider = $2 AND deleted_at IS NULL;
+  `;
+    const { rowCount } = await this.db.query(sql, [userId, provider]);
+    return (rowCount ?? 0) > 0;
+  }
+
+  /**
+   * Checks authentication methods for account lockout prevention.
+   */
+  async getUserAuthSummary(userId: string): Promise<{
+    hasPassword: boolean;
+    linkedProvidersCount: number;
+  }> {
+    const sql = `
+    SELECT 
+      (u.password_hash IS NOT NULL) AS "hasPassword",
+      COUNT(i.id)::int AS "linkedProvidersCount"
+    FROM user_account u
+    LEFT JOIN user_identity i ON u.id = i.user_id AND i.deleted_at IS NULL
+    WHERE u.id = $1 AND u.deleted_at IS NULL
+    GROUP BY u.id;
+  `;
+    const { rows } = await this.db.query<{
+      hasPassword: boolean;
+      linkedProvidersCount: number;
+    }>(sql, [userId]);
+
+    return rows[0] ?? { hasPassword: false, linkedProvidersCount: 0 };
+  }
+
+  async updatePassword(data: UpdatePasswordData): Promise<boolean> {
+    const { id, new_password } = data;
+
+    const sql = 'UPDATE user_account SET password_hash = $1 WHERE id = $2';
+
+    const result = await this.db.query(sql, [new_password, id]);
+
+    return result.rowCount === 1;
+  }
+
+  async getPassword(id: string): Promise<PasswordType> {
+    const sql = 'SELECT password_hash FROM user_account WHERE id = $1';
+
+    const result = await this.db.query<PasswordType>(sql, [id]);
+
+    return result.rows[0];
   }
 }

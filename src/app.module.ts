@@ -9,6 +9,7 @@ import { EmailModule } from './modules/email/email.module';
 import { validate } from './config/env.config';
 import { RespondersModule } from './modules/responders/responders.module';
 import { DriverModule } from './modules/drivers/drivers.module';
+import { SmsModule } from './modules/sms/sms.module';
 
 @Module({
   imports: [
@@ -22,6 +23,7 @@ import { DriverModule } from './modules/drivers/drivers.module';
     EmailModule,
     RespondersModule,
     DriverModule,
+    SmsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -6,7 +6,7 @@ WORKDIR /app
 COPY package*.json ./
 RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 
-# Copy only files needed to build
+# Copy configuration and source files needed to build
 COPY tsconfig*.json ./
 COPY nest-cli.json ./
 COPY src ./src
@@ -19,16 +19,19 @@ FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 
-# Install production dependencies only
+# Install production dependencies only (includes node-pg-migrate)
 COPY package*.json ./
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev; fi
 
-# Copy built artifacts
+# Copy built application code
 COPY --from=builder /app/dist ./dist
 
-# Railway provides PORT; default to 8080
+# Copy raw SQL migration files into the runtime environment
+COPY migrations ./migrations
+
+# Environment and port defaults
 ENV PORT=8080
 EXPOSE 8080
 
-# Start the application (package.json: start:prod -> node dist/main.js)
+# Execute database migrations before starting main server process
 CMD ["npm", "run", "start:prod"]

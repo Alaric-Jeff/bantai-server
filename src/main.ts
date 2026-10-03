@@ -9,7 +9,6 @@ import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
 
 async function bootstrap() {
-  const isProd = process.env.NODE_ENV === 'production';
 
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
@@ -17,12 +16,6 @@ async function bootstrap() {
       logger: false, // Disables Fastify internal HTTP logging
       trustProxy: true,
     }),
-    {
-      // Restricts NestJS framework logs (suppresses InstanceLoader, RouterExplorer, etc.)
-      logger: isProd
-        ? ['error', 'warn']
-        : ['log', 'debug', 'verbose', 'warn', 'error'],
-    },
   );
 
   const configService = app.get(ConfigService);

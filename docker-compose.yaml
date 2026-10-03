@@ -1,4 +1,52 @@
 services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bantai_local_api
+    environment:
+      APP_NAME: ${APP_NAME:-BANTAI}
+      APP_ENV: ${APP_ENV:-development}
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3001}
+      API_PREFIX: ${API_PREFIX:-/api/v1}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3001}
+      SUPERADMIN_EMAIL: ${SUPERADMIN_EMAIL:-admin@bantai.ph}
+      SUPERADMIN_PASSWORD: ${SUPERADMIN_PASSWORD:-change_me}
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 3000
+      HOST: 0.0.0.0
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: ${DB_USERNAME:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-bantai_local_password}
+      DB_DATABASE: ${DB_DATABASE:-bantai_dev}
+      DB_POOL_MAX: ${DB_POOL_MAX:-20}
+      DB_POOL_IDLE_TIMEOUT: ${DB_POOL_IDLE_TIMEOUT:-30000}
+      DB_POOL_CONN_TIMEOUT: ${DB_POOL_CONN_TIMEOUT:-2000}
+      DATABASE_URL: postgresql://${DB_USERNAME:-postgres}:${DB_PASSWORD:-bantai_local_password}@postgres:5432/${DB_DATABASE:-bantai_dev}?sslmode=disable
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-local_jwt_secret}
+      JWT_EXPIRATION: ${JWT_EXPIRATION:-15m}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-local_jwt_refresh_secret}
+      JWT_REFRESH_EXPIRATION: ${JWT_REFRESH_EXPIRATION:-7d}
+      COOKIE_SECRET: ${COOKIE_SECRET:-local_cookie_secret}
+      ACTIVATION_TOKEN_EXPIRATION: ${ACTIVATION_TOKEN_EXPIRATION:-24h}
+      PASSWORD_RESET_TOKEN_EXPIRATION: ${PASSWORD_RESET_TOKEN_EXPIRATION:-1h}
+      DEFAULT_ALERT_RADIUS_METERS: ${DEFAULT_ALERT_RADIUS_METERS:-5000}
+      HEARTBEAT_TIMEOUT_SECONDS: ${HEARTBEAT_TIMEOUT_SECONDS:-3}
+      RESEND_API_KEY: ${RESEND_API_KEY:-re_local_development_key}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   # PostgreSQL 16 with PostGIS 3.4 pre-compiled
   postgres:
     image: postgis/postgis:16-3.4
@@ -8,16 +56,26 @@ services:
       POSTGRES_USER: ${DB_USERNAME}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     ports:
-      - "${DB_PORT}:5432"
+      - "${DB_PORT:-5432}:5432"
     volumes:
       - pgdata_local:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   # Redis for WebSocket Pub/Sub & Heartbeat Timers
   redis:
     image: redis:7-alpine
     container_name: bantai_local_redis
     ports:
-      - "${REDIS_PORT}:6379"
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   pgdata_local:

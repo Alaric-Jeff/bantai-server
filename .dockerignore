@@ -1,0 +1,29 @@
+# Ignore unnecessary files for docker build context
+node_modules
+npm-debug.log
+.yarn
+.pnp.cjs
+.pnp.loader.mjs
+
+# Dist and coverage
+coverage
+dist
+
+# Env and local files
+.env
+.env.*
+*.local
+
+# Git and editor
+.git
+.gitignore
+.vscode
+
+# Tests
+/test
+**/*.spec.ts
+**/*.e2e-spec.ts
+
+# OS files
+.DS_Store
+Thumbs.db

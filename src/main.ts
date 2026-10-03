@@ -9,12 +9,20 @@ import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
 
 async function bootstrap() {
+  const isProd = process.env.NODE_ENV === 'production';
+
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
     new FastifyAdapter({
-      logger: false,
+      logger: false, // Disables Fastify internal HTTP logging
       trustProxy: true,
     }),
+    {
+      // Restricts NestJS framework logs (suppresses InstanceLoader, RouterExplorer, etc.)
+      logger: isProd
+        ? ['error', 'warn']
+        : ['log', 'debug', 'verbose', 'warn', 'error'],
+    },
   );
 
   const configService = app.get(ConfigService);
@@ -22,11 +30,6 @@ async function bootstrap() {
   const host = configService.get<string>('HOST', '0.0.0.0');
   const apiPrefix = configService.get<string>('API_PREFIX', '/api/v1');
 
-  // CORS_ORIGIN is a comma-separated list of allowed origins, e.g.
-  //   CORS_ORIGIN=http://localhost:3001,http://localhost:5173,https://onboarding.example.com
-  // (ConfigService.get only takes ONE default, so the list has to be
-  // parsed from a single string.) In production this must include the
-  // onboarding SPA's origin — the same value as FRONTEND_URL.
   const corsOrigins = configService
     .get<string>('CORS_ORIGIN', 'http://localhost:3001,http://localhost:5173')
     .split(',')
